@@ -1,3 +1,10 @@
+# At top of train.py
+try:
+    import modal
+    volume = modal.Volume.from_name("gector-data")
+except ImportError:
+    volume = None   # running locally, no-op
+
 import argparse
 from transformers import AutoTokenizer, get_scheduler
 from gector import (
@@ -22,6 +29,8 @@ import numpy as np
 import random
 from collections import OrderedDict
 from gector.utils import has_args_add_pooling
+from pathlib import Path
+
 
 def solve_model_id(model_id):
     if model_id == 'deberta-base':
@@ -31,6 +40,16 @@ def solve_model_id(model_id):
     else:
         return model_id
 
+def _prune_checkpoints(save_dir: str, limit: int):
+    ckpts = sorted(
+        Path(save_dir).glob("checkpoint_*"),
+        key=os.path.getmtime
+    )
+    for old in ckpts[:-limit]:
+        import shutil
+        shutil.rmtree(old)
+        print(f"  Pruned old checkpoint: {old}")
+
 def train(
     model,
     loader,
@@ -38,16 +57,28 @@ def train(
     lr_scheduler,
     accelerator,
     epoch,
-    step_scheduler
+    step_scheduler,
+    global_step,          # <-- add
+    checkpointing_steps,  # <-- add
+    save_dir,             # <-- add
+    volume,               # <-- add
+    checkpoints_total_limit, # <-- add
+    resume_step=0,        # <-- add (only non-zero on first resumed epoch)
 ):
     log = {
         'loss': 0,
         'accuracy': 0,
         'accuracy_d': 0
     }
+    n_batches = 0  # track actual batches run (skip doesn't count)
     model.train()
     pbar = tqdm(loader, total=len(loader), disable=not accelerator.is_main_process)
-    for batch in pbar:
+    for step, batch in enumerate(pbar):
+
+        # Skip steps already done before preemption
+        if step < resume_step:
+            continue
+
         with accelerator.accumulate(model):
             outputs = model(**batch)
             loss = outputs.loss
@@ -56,18 +87,35 @@ def train(
             optimizer.step()
             if step_scheduler:
                 lr_scheduler.step()
-            log['loss'] += loss.item()
-            log['accuracy'] += outputs.accuracy.item()
-            log['accuracy_d'] += outputs.accuracy_d.item()
+
+        global_step += 1
+        n_batches += 1
+        log['loss'] += loss.item()
+        log['accuracy'] += outputs.accuracy.item()
+        log['accuracy_d'] += outputs.accuracy_d.item()
+
+        if accelerator.is_main_process:
+            pbar.set_description(f'[Epoch {epoch}] [TRAIN]')
+            pbar.set_postfix(OrderedDict(
+                loss=loss.item(),
+                accuracy=outputs.accuracy.item(),
+                accuracy_d=outputs.accuracy_d.item(),
+                lr=optimizer.param_groups[0]['lr']
+            ))
+
+        # ── Step checkpoint ───────────────────────────────────────
+        if global_step % checkpointing_steps == 0:
+            accelerator.wait_for_everyone()
+            ckpt_path = os.path.join(save_dir, f"checkpoint_{global_step}")  # <-- define it here
+            accelerator.save_state(ckpt_path)   # all processes must call this
             if accelerator.is_main_process:
-                pbar.set_description(f'[Epoch {epoch}] [TRAIN]')
-                pbar.set_postfix(OrderedDict(
-                    loss=loss.item(),
-                    accuracy=outputs.accuracy.item(),
-                    accuracy_d=outputs.accuracy_d.item(),
-                    lr=optimizer.param_groups[0]['lr']
-                ))
-    return {k:v/len(loader) for k,v in log.items()}
+                if volume is not None:
+                    volume.commit()
+                _prune_checkpoints(save_dir, checkpoints_total_limit)
+                print(f"  [step {global_step}] checkpoint saved → {ckpt_path}")
+
+    n_batches = max(n_batches, 1)  # avoid div-by-zero if all steps were skipped
+    return {k: v / n_batches for k, v in log.items()}, global_step
 
 @torch.no_grad()
 def valid(
@@ -108,7 +156,9 @@ def main(args):
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms = True
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.accumulation)
+    accelerator = Accelerator(gradient_accumulation_steps=args.accumulation,
+                              project_dir=args.save_dir,
+    )
     if args.restore_dir is not None:
         tokenizer = AutoTokenizer.from_pretrained(args.restore_dir)
     else:
@@ -205,6 +255,36 @@ def main(args):
     model, optimizer, train_loader, valid_loader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_loader, valid_loader, lr_scheduler
     )
+    # ── Resume logic ──────────────────────────────────────────────────────────────
+    resume_step  = 0
+    resume_epoch = 0
+    global_step  = 0
+
+    resume_path = args.resume_from_checkpoint
+    if resume_path == "auto":
+        ckpt_dirs = [
+            d for d in Path(args.save_dir).glob("checkpoint_*") if d.is_dir()
+        ]
+        if ckpt_dirs:
+            resume_path = str(max(ckpt_dirs, key=os.path.getmtime))
+            print(f"Auto-resuming from {resume_path}")
+        else:
+            resume_path = None
+            print("No checkpoint found, starting from scratch.")
+
+    if resume_path and Path(resume_path).exists():
+        accelerator.load_state(resume_path)
+        try:
+            global_step  = int(Path(resume_path).name.split("_")[-1])
+            steps_per_epoch = len(train_loader)
+            resume_epoch = global_step // steps_per_epoch
+            resume_step  = global_step % steps_per_epoch
+            print(f"Resumed at global_step={global_step} "
+                f"(epoch {resume_epoch}, step {resume_step})")
+        except ValueError:
+            pass
+    # ─────────────────────────────────────────────────────────────────────────────
+
     path_to_best = os.path.join(args.save_dir, 'best')
     path_to_last = os.path.join(args.save_dir, 'last')
     os.makedirs(path_to_best, exist_ok=True)
@@ -217,7 +297,7 @@ def main(args):
         for param in optimizer.param_groups:
             param['lr'] = lr
     logs = {'argparse': args.__dict__}
-    for e in range(args.n_epochs):
+    for e in range(resume_epoch, args.n_epochs):
         accelerator.wait_for_everyone()
         if isinstance(model, DistributedDataParallel):
             module = model.module
@@ -234,14 +314,20 @@ def main(args):
         else:
             pass
         print(f'=== Epoch {e} ===')
-        train_log = train(
+        train_log, global_step = train(
             model,
             train_loader,
             optimizer,
             lr_scheduler,
             accelerator,
             e,
-            step_scheduler
+            step_scheduler,
+            global_step=global_step,                            # <-- add
+            checkpointing_steps=args.checkpointing_steps,       # <-- add
+            save_dir=args.save_dir,                             # <-- add
+            volume=volume,                                      # <-- add
+            checkpoints_total_limit=args.checkpoints_total_limit, # <-- add
+            resume_step=resume_step if e == resume_epoch else 0,  # <-- add
         )
         valid_log = valid(
             model,
@@ -292,7 +378,18 @@ def get_parser():
         default="constant",
         choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
     )
-    
+    # In get_parser(), add:
+    parser.add_argument('--resume_from_checkpoint', default=None,
+        help='Path to an Accelerate checkpoint dir to resume from. '
+            'Pass "auto" to auto-find the latest in save_dir.')
+    parser.add_argument('--checkpointing_steps', type=int, default=1000,
+        help='Save an Accelerate checkpoint every N steps.')
+    parser.add_argument('--checkpoints_total_limit', type=int, default=2,
+        help='Keep only the N most recent step checkpoints to save disk space.')
+    parser.add_argument('--resume_from_checkpoint', default=None,
+        help='"auto" to find latest checkpoint, or explicit path.')
+    parser.add_argument('--checkpointing_steps', type=int, default=500)
+    parser.add_argument('--checkpoints_total_limit', type=int, default=2)
     args = parser.parse_args()
     return args
 

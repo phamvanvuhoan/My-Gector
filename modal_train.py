@@ -30,11 +30,11 @@ image = (
         "accelerate>=1.3.0",
         "huggingface-hub>=0.28.1",
         "python-levenshtein>=0.26.1",
-        "git+https://github.com/gotutiyan/gector",
+        "git+https://github.com/phamvanvuhoan/My-Gector/tree/main/src/gector",
     )
 )
 
-GPU = modal.gpu.A100()   # swap to A10G() for cheaper runs; A100 recommended for stage1
+GPU = "A100"  # swap to A10G() for cheaper runs; A100 recommended for stage1
 
 # ── Shared paths inside the volume ────────────────────────────────────────────
 
@@ -70,12 +70,18 @@ STAGE_CFG = {
 }
 
 # ── Core training function (runs on Modal GPU) ─────────────────────────────────
+MAX_RETRIES = 10   # Modal preempts at most this many times before we give up
 
 @app.function(
     image   = image,
     gpu     = GPU,
     volumes = {MOUNT: volume},
     timeout = 86400,   # 24 h — stage 1 can be long
+    retries = modal.Retries(        # Modal-level retry on preemption/OOM
+        max_retries    = MAX_RETRIES,
+        backoff_coefficient = 1.0,
+        initial_delay  = 5.0,
+    ),
 )
 def train_stage(
     stage:         int,
@@ -121,6 +127,9 @@ def train_stage(
         "--batch_size",       str(cfg["batch_size"]),
         "--n_cold_epochs",    str(cfg["n_cold_epochs"]),
         "--n_epochs",         str(cfg["n_epochs"]),
+        "--checkpointing_steps",   "500",    # save every 500 steps
+        "--checkpoints_total_limit", "2",    # keep last 2 only
+        "--resume_from_checkpoint", "auto",  # always try to resume
         "--lr",               str(lr),
         "--cold_lr",          str(cold_lr),
         "--max_len",          str(max_len),
