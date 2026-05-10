@@ -131,7 +131,7 @@ def train_stage(
         "--n_epochs",         str(cfg["n_epochs"]),
         "--checkpointing_steps",   "500",    # save every 500 steps
         "--checkpoints_total_limit", "2",    # keep last 2 only
-        "--resume_from_checkpoint", "auto",  # always try to resume
+        "--resume_ckpt", "auto",  # always try to resume
         "--lr",               str(lr),
         "--cold_lr",          str(cold_lr),
         "--max_len",          str(max_len),

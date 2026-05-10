@@ -260,7 +260,7 @@ def main(args):
     resume_epoch = 0
     global_step  = 0
 
-    resume_path = args.resume_from_checkpoint
+    resume_path = args.resume_ckpt
     if resume_path == "auto":
         ckpt_dirs = [
             d for d in Path(args.save_dir).glob("checkpoint_*") if d.is_dir()
@@ -386,7 +386,7 @@ def get_parser():
         help='Save an Accelerate checkpoint every N steps.')
     parser.add_argument('--checkpoints_total_limit', type=int, default=2,
         help='Keep only the N most recent step checkpoints to save disk space.')
-    parser.add_argument('--resume_from_checkpoint', default=None,
+    parser.add_argument('--resume_ckpt', default=None,
         help='"auto" to find latest checkpoint, or explicit path.')
     parser.add_argument('--checkpointing_steps', type=int, default=500)
     parser.add_argument('--checkpoints_total_limit', type=int, default=2)
