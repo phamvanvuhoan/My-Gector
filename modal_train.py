@@ -33,6 +33,7 @@ image = (
         "python-levenshtein>=0.26.1",
         "git+https://github.com/phamvanvuhoan/My-Gector.git",
     )
+    .copy_local_file("train.py", "/root/train.py")   # <-- add this
 )
 
 GPU = "A100"  # swap to A10G() for cheaper runs; A100 recommended for stage1
