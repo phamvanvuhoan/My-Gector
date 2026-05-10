@@ -16,6 +16,7 @@ class GECToRConfig(PretrainedConfig):
         has_add_pooling_layer: bool=True,
         initializer_range: float=0.02,
         is_official_model: bool=False,
+        label_weights: list = None,   # <-- add this
         **kwards
     ):
         super().__init__(**kwards)
@@ -38,3 +39,5 @@ class GECToRConfig(PretrainedConfig):
         self.has_add_pooling_layer = has_add_pooling_layer
         self.initializer_range = initializer_range
         self.is_official_model = is_official_model
+        # Store as plain list so it's JSON-serializable for save_pretrained
+        self.label_weights = label_weights
