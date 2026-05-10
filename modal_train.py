@@ -24,13 +24,14 @@ MOUNT  = "/gector-data"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git")
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
         "accelerate>=1.3.0",
         "huggingface-hub>=0.28.1",
         "python-levenshtein>=0.26.1",
-        "git+https://github.com/phamvanvuhoan/My-Gector/tree/main/src/gector",
+        "git+https://github.com/phamvanvuhoan/My-Gector.git",
     )
 )
 
