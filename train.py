@@ -59,10 +59,10 @@ def train(
     epoch,
     step_scheduler,
     global_step,          # <-- add
-    checkpointing_steps,  # <-- add
+    ckpt_steps,  # <-- add
     save_dir,             # <-- add
     volume,               # <-- add
-    checkpoints_total_limit, # <-- add
+    ckpt_limit, # <-- add
     resume_step=0,        # <-- add (only non-zero on first resumed epoch)
 ):
     log = {
@@ -104,14 +104,14 @@ def train(
             ))
 
         # ── Step checkpoint ───────────────────────────────────────
-        if global_step % checkpointing_steps == 0:
+        if global_step % ckpt_steps == 0:
             accelerator.wait_for_everyone()
             ckpt_path = os.path.join(save_dir, f"checkpoint_{global_step}")  # <-- define it here
             accelerator.save_state(ckpt_path)   # all processes must call this
             if accelerator.is_main_process:
                 if volume is not None:
                     volume.commit()
-                _prune_checkpoints(save_dir, checkpoints_total_limit)
+                _prune_checkpoints(save_dir, ckpt_limit)
                 print(f"  [step {global_step}] checkpoint saved → {ckpt_path}")
 
     n_batches = max(n_batches, 1)  # avoid div-by-zero if all steps were skipped
@@ -323,10 +323,10 @@ def main(args):
             e,
             step_scheduler,
             global_step=global_step,                            # <-- add
-            checkpointing_steps=args.checkpointing_steps,       # <-- add
+            ckpt_steps=args.ckpt_steps,       # <-- add
             save_dir=args.save_dir,                             # <-- add
             volume=volume,                                      # <-- add
-            checkpoints_total_limit=args.checkpoints_total_limit, # <-- add
+            ckpt_limit=args.ckpt_limit, # <-- add
             resume_step=resume_step if e == resume_epoch else 0,  # <-- add
         )
         valid_log = valid(
@@ -388,8 +388,8 @@ def get_parser():
         help='Keep only the N most recent step checkpoints to save disk space.')
     parser.add_argument('--resume_ckpt', default=None,
         help='"auto" to find latest checkpoint, or explicit path.')
-    parser.add_argument('--checkpointing_steps', type=int, default=500)
-    parser.add_argument('--checkpoints_total_limit', type=int, default=2)
+    parser.add_argument('--ckpt_steps', type=int, default=500)
+    parser.add_argument('--ckpt_limit', type=int, default=2)
     args = parser.parse_args()
     return args
 
