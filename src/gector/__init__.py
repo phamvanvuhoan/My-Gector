@@ -8,6 +8,7 @@ from .vocab import (
     load_vocab_from_config,
     load_vocab_from_official
 )
+from .beam_predict import beam_predict
 __all__ = [
     'GECToR',
     'GECToRConfig',
@@ -18,5 +19,6 @@ __all__ = [
     'predict_verbose',
     'build_vocab',
     'load_vocab_from_config',
-    'load_vocab_from_official'
+    'load_vocab_from_official',
+    'beam_predict'
 ]

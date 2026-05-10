@@ -8,7 +8,9 @@ from gector import (
     load_vocab_from_config,
     load_vocab_from_official
 )
+from gector.vocab import compute_class_weights
 import torch
+from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 import os
@@ -164,6 +166,19 @@ def main(args):
     valid_dataset.append_vocab(
         model.config.label2id,
         model.config.d_label2id
+    )
+    label_weights = compute_class_weights(
+    train_dataset,
+    model.config.label2id,          # or gector_config.label2id if building fresh
+    strategy='sqrt_inverse_freq',   # gentler than raw inverse for GEC
+    max_weight=10.0
+    )
+    # Store in config so it's saved with the checkpoint
+    model.config.label_weights = label_weights.tolist()
+    # Inject into the already-constructed loss_fn
+    model.loss_fn = CrossEntropyLoss(
+        label_smoothing=args.label_smoothing,
+        weight=label_weights
     )
     print('# instances of train:', len(train_dataset))
     print('# instances of valid:', len(valid_dataset))

@@ -62,6 +62,7 @@ def main(args):
     else:
         model = GECToR.from_pretrained(args.restore_dir).eval()
         tokenizer = AutoTokenizer.from_pretrained(args.restore_dir)
+
     srcs = open(args.input).read().rstrip().split('\n')
     encode, decode = load_verb_dict(args.verb_file)
     if torch.cuda.is_available():
@@ -77,6 +78,21 @@ def main(args):
         'batch_size': args.batch_size,
         'n_iteration': args.n_iteration
     }
+
+    if args.beam_size > 1:
+        from gector import beam_predict
+        final_corrected_sents = beam_predict(
+            model, tokenizer, srcs, encode, decode,
+            beam_size=args.beam_size,
+            keep_confidence=args.keep_confidence,
+            min_error_prob=args.min_error_prob,
+            n_iteration=args.n_iteration,
+            batch_size=args.batch_size,
+            length_penalty=args.length_penalty
+        )
+    else:
+        final_corrected_sents = predict(**predict_args)
+
     if args.visualize is not None:
         final_corrected_sents, iteration_log = predict_verbose(
             **predict_args
@@ -205,6 +221,9 @@ def get_parser():
         '--official.max_length', type=int, default=80,
         help='If the number of subwords is longer than this, it will be truncated.'
     )
+    parser.add_argument('--beam_size', type=int, default=1,
+        help='Beam size. 1 = greedy (default). >1 enables beam search.')
+    parser.add_argument('--length_penalty', type=float, default=0.0)
     args = parser.parse_args()
     return args
 

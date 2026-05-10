@@ -48,6 +48,15 @@ class GECToR(PreTrainedModel):
             self.bert = AutoModel.from_pretrained(
                 self.config.model_id
             )
+
+        # Build weighted loss; falls back to uniform if no weights given
+        if config.label_weights is not None:
+            weight_tensor = torch.tensor(
+                config.label_weights, dtype=torch.float
+            )
+        else:
+            weight_tensor = None
+        
         # +1 is for $START token
         # Note: In transformers > 4.49.0, `self.bert` is loaded
         #   as a meta tensors, so the model does not hold actual values. 
@@ -68,6 +77,11 @@ class GECToR(PreTrainedModel):
         )
         self.dropout = nn.Dropout(self.config.p_dropout)
         self.loss_fn = CrossEntropyLoss(
+            label_smoothing=self.config.label_smoothing,
+            weight=weight_tensor          # <-- only change here
+        )
+        # Detection loss stays unweighted (only 2 classes, balanced enough)
+        self.loss_fn_d = CrossEntropyLoss(
             label_smoothing=self.config.label_smoothing
         )
         
@@ -128,14 +142,17 @@ class GECToR(PreTrainedModel):
             # -100 is the default ignore_idx of CrossEntropyLoss
             labels[labels == pad_id] = -100
             d_labels[labels == -100] = -100
-            loss_d = self.loss_fn(
-                logits_d.view(-1, self.config.d_num_labels - 1),  # -1 for <PAD>
+            loss_d = self.loss_fn_d(          # use unweighted loss for detection
+                logits_d.view(-1, self.config.d_num_labels - 1),
                 d_labels.view(-1)
             )
-            loss_labels = self.loss_fn(
+            loss_labels = self.loss_fn(       # weighted loss for tags
                 logits_labels.view(-1, self.config.num_labels - 1),
                 labels.view(-1)
             )
+            # Weight tensor must move with the model; handle device mismatch:
+            if self.loss_fn.weight is not None:
+                self.loss_fn.weight = self.loss_fn.weight.to(logits_labels.device)
             loss = loss_d + loss_labels
 
             pred_labels = torch.argmax(logits_labels, dim=-1)
