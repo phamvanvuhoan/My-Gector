@@ -31,6 +31,7 @@ image = (
         "accelerate>=1.3.0",
         "huggingface-hub>=0.28.1",
         "python-levenshtein>=0.26.1",
+        "wandb",
     )
     .run_commands(
         "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
@@ -50,7 +51,7 @@ STAGE_CFG = {
     1: dict(
         train_file  = f"{DATA}/stage1.train",
         valid_file  = f"{DATA}/stage1.dev",
-        batch_size  = 256,
+        batch_size  = 2048,
         n_cold_epochs = 2,
         n_epochs    = 10,
         save_dir    = f"{SAVE_BASE}/stage1",
@@ -58,7 +59,7 @@ STAGE_CFG = {
     2: dict(
         train_file  = f"{DATA}/stage2.train",
         valid_file  = f"{DATA}/stage2.dev",
-        batch_size  = 128,
+        batch_size  = 2048,
         n_cold_epochs = 2,
         n_epochs    = 10,
         save_dir    = f"{SAVE_BASE}/stage2",
@@ -66,7 +67,7 @@ STAGE_CFG = {
     3: dict(
         train_file  = f"{DATA}/stage3.train",
         valid_file  = f"{DATA}/stage3.dev",
-        batch_size  = 128,
+        batch_size  = 512,
         n_cold_epochs = 0,
         n_epochs    = 10,
         save_dir    = f"{SAVE_BASE}/stage3",
@@ -150,6 +151,7 @@ MAX_RETRIES = 10   # Modal preempts at most this many times before we give up
     gpu     = GPU,
     volumes = {MOUNT: volume},
     timeout = 86400,   # 24 h — stage 1 can be long
+    secrets = [modal.Secret.from_name("wandb-secret")],   # <-- add
     retries = modal.Retries(        # Modal-level retry on preemption/OOM
         max_retries    = MAX_RETRIES,
         backoff_coefficient = 1.0,
@@ -219,6 +221,11 @@ def train_stage(
         cmd += ["--restore_dir", restore_dir]
     else:
         cmd += ["--model_id", model_id]
+
+    cmd += [
+        "--wandb_project", "gector",
+        "--wandb_run_name", f"stage{stage}_{model_id}",
+    ]
 
     print(f"\n=== Stage {stage} command ===")
     print(" ".join(cmd))
