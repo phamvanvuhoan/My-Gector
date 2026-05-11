@@ -30,6 +30,7 @@ import random
 from collections import OrderedDict
 from gector.utils import has_args_add_pooling
 from pathlib import Path
+import wandb
 
 
 def solve_model_id(model_id):
@@ -102,6 +103,15 @@ def train(
                 accuracy_d=outputs.accuracy_d.item(),
                 lr=optimizer.param_groups[0]['lr']
             ))
+            # ── W&B step log ─────────────────────────────────────
+            if wandb.run is not None:
+                wandb.log({
+                    'train/loss':       loss.item(),
+                    'train/accuracy':   outputs.accuracy.item(),
+                    'train/accuracy_d': outputs.accuracy_d.item(),
+                    'train/lr':         optimizer.param_groups[0]['lr'],
+                    'train/epoch':      epoch,
+                }, step=global_step)
 
         # ── Step checkpoint ───────────────────────────────────────
         if global_step % ckpt_steps == 0:
@@ -159,6 +169,17 @@ def main(args):
     accelerator = Accelerator(gradient_accumulation_steps=args.accumulation,
                               project_dir=args.save_dir,
     )
+    import wandb
+    # only log from main process to avoid duplicate runs
+    if accelerator.is_main_process and args.wandb_project:
+        wandb.init(
+            project  = args.wandb_project,
+            name     = args.wandb_run_name,
+            config   = vars(args),         # logs all hyperparams automatically
+            resume   = "allow",            # resumes the same run after preemption
+            id       = args.wandb_run_name # stable id so preemption resume works
+        )
+
     if args.restore_dir is not None:
         tokenizer = AutoTokenizer.from_pretrained(args.restore_dir)
     else:
@@ -235,12 +256,19 @@ def main(args):
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True
+        shuffle=True,
+        num_workers=4,        # <-- add
+        pin_memory=True,      # <-- add, faster CPU→GPU transfer
+        prefetch_factor=2,    # <-- prefetch 2 batches per worker
+        persistent_workers=True,  # <-- keep workers alive between epochs
     )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=args.batch_size,
-        shuffle=False
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
     )
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -348,6 +376,19 @@ def main(args):
             }
             with open(os.path.join(args.save_dir, 'log.json'), 'w') as f:
                 json.dump(logs, f, indent=2)
+            # ── W&B epoch log ─────────────────────────────────────────────
+            if args.wandb_project:
+                wandb.log({
+                    'epoch/train_loss':       train_log['loss'],
+                    'epoch/train_accuracy':   train_log['accuracy'],
+                    'epoch/train_accuracy_d': train_log['accuracy_d'],
+                    'epoch/valid_loss':       valid_log['loss'],
+                    'epoch/valid_accuracy':   valid_log['accuracy'],
+                    'epoch/valid_accuracy_d': valid_log['accuracy_d'],
+                    'epoch/is_best':          valid_log.get('message') is not None,
+                }, step=global_step)
+    if accelerator.is_main_process and args.wandb_project:
+        wandb.finish()
     print('finish')
 
 def get_parser():
@@ -390,6 +431,9 @@ def get_parser():
         help='"auto" to find latest checkpoint, or explicit path.')
     parser.add_argument('--ckpt_steps', type=int, default=500)
     parser.add_argument('--ckpt_limit', type=int, default=2)
+    parser.add_argument('--wandb_project',  default=None,
+        help='W&B project name. Omit to disable wandb.')
+    parser.add_argument('--wandb_run_name', default=None)
     args = parser.parse_args()
     return args
 
