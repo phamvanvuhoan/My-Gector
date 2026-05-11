@@ -106,7 +106,7 @@ gector_image = (
     ])
     .add_commands([
         # Install your fork of gector
-        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
+        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git@beam-version"
     ])
 )
 
