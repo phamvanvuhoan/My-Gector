@@ -257,6 +257,21 @@ def preprocess(
     preprocess_all.remote(model_id=model_id, max_len=max_len)
 
 @app.local_entrypoint()
+def clear_cache():
+    import subprocess
+    clear.remote()
+
+@app.function(image=image, volumes={MOUNT: volume})
+def clear():
+    import glob, os
+    files = glob.glob(f"{MOUNT}/cache/*")
+    for f in files:
+        os.remove(f)
+        print(f"Deleted {f}")
+    volume.commit()
+    print("✓ Cache cleared")
+
+@app.local_entrypoint()
 def run_stage1(
     model_id:   str   = "roberta-base",
     batch_size: int   = 0,     # 0 = use default from STAGE_CFG
