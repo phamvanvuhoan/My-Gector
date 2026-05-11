@@ -1,0 +1,351 @@
+"""
+beam_train.py — Three-stage GECToR training on Beam Cloud (RTX 4090).
+
+Prerequisites
+─────────────
+1. Install & configure the Beam SDK locally:
+       pip install beam-client
+       beam configure default --token <YOUR_TOKEN>
+
+2. Create the persistent volume (once):
+       beam volume create gector-data
+
+3. Upload your preprocessed data to the volume:
+       beam cp data/output_vocabulary  beam://gector-data/data/output_vocabulary
+       beam cp stage1.train            beam://gector-data/data/stage1.train
+       beam cp stage1.dev              beam://gector-data/data/stage1.dev
+       # … repeat for stage2 / stage3 files
+
+4. Store your W&B API key as a Beam secret (once):
+       beam secret create WANDB_API_KEY <your_key>
+
+Usage
+─────
+# Preprocess (CPU-only, fast):
+    python beam_train.py preprocess
+
+# Train stage 1:
+    python beam_train.py stage1
+
+# Train stage 2 (auto-resumes from stage 1 checkpoint):
+    python beam_train.py stage2
+
+# Train stage 3:
+    python beam_train.py stage3
+
+# Download best checkpoint from stage 3:
+    python beam_train.py download --stage 3 --which best --local-dir ./my_model
+
+Optional overrides (any stage):
+    python beam_train.py stage1 --model-id bert-base-cased --batch-size 512
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+from beam import Image, Volume, Secret, function
+
+# ── Shared volume / paths ──────────────────────────────────────────────────────
+
+VOLUME_NAME = "gector-data"
+MOUNT       = "./gector-data"          # Beam mounts at a relative path inside the container
+
+DATA        = f"{MOUNT}/data"
+VOCAB_DIR   = f"{DATA}/output_vocabulary"
+SAVE_BASE   = f"{MOUNT}/checkpoints"
+HF_CACHE    = f"{MOUNT}/hf_cache"
+CACHE_DIR   = f"{MOUNT}/cache"
+
+# ── Per-stage hyperparameters ──────────────────────────────────────────────────
+
+STAGE_CFG = {
+    1: dict(
+        train_file    = f"{DATA}/stage1.train",
+        valid_file    = f"{DATA}/stage1.dev",
+        batch_size    = 512,       # RTX 4090 has 24 GB VRAM; tune this down if OOM
+        n_cold_epochs = 2,
+        n_epochs      = 10,
+        save_dir      = f"{SAVE_BASE}/stage1",
+    ),
+    2: dict(
+        train_file    = f"{DATA}/stage2.train",
+        valid_file    = f"{DATA}/stage2.dev",
+        batch_size    = 256,
+        n_cold_epochs = 2,
+        n_epochs      = 10,
+        save_dir      = f"{SAVE_BASE}/stage2",
+    ),
+    3: dict(
+        train_file    = f"{DATA}/stage3.train",
+        valid_file    = f"{DATA}/stage3.dev",
+        batch_size    = 256,
+        n_cold_epochs = 0,
+        n_epochs      = 10,
+        save_dir      = f"{SAVE_BASE}/stage3",
+    ),
+}
+
+# ── Container image (built once, cached by Beam) ───────────────────────────────
+
+gector_image = (
+    Image(python_version="python3.11")
+    .add_commands(["apt-get update -y", "apt-get install -y git"])
+    .add_python_packages([
+        "torch>=2.6.0",
+        "transformers>=4.49.0",
+        "accelerate>=1.3.0",
+        "huggingface-hub>=0.28.1",
+        "python-levenshtein>=0.26.1",
+        "wandb",
+    ])
+    .add_commands([
+        # Install your fork of gector
+        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
+    ])
+)
+
+# Beam Volume object — attached to every function below
+gector_volume = Volume(name=VOLUME_NAME, mount_path=MOUNT)
+
+# ── Preprocessing (CPU-only) ───────────────────────────────────────────────────
+
+@function(
+    image   = gector_image,
+    cpu     = 8,
+    memory  = "32Gi",
+    volumes = [gector_volume],
+    timeout = 7200,
+    secrets = [Secret(name="WANDB_API_KEY")],
+)
+def preprocess_all(model_id: str = "roberta-base", max_len: int = 80):
+    """
+    Tokenise and cache all stage datasets on CPU.
+    Run once before any training stage.
+    """
+    import os
+    from transformers import AutoTokenizer
+    from gector import load_dataset
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(HF_CACHE,  exist_ok=True)
+    os.environ["HF_HOME"]          = HF_CACHE
+    os.environ["GECTOR_CACHE_DIR"] = CACHE_DIR
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, add_prefix_space=True
+    )
+    tokenizer.add_special_tokens({"additional_special_tokens": ["$START"]})
+
+    stages = [
+        (f"{DATA}/stage1.train", "stage1 train"),
+        (f"{DATA}/stage1.dev",   "stage1 dev"),
+        (f"{DATA}/stage2.train", "stage2 train"),
+        (f"{DATA}/stage2.dev",   "stage2 dev"),
+        (f"{DATA}/stage3.train", "stage3 train"),
+        (f"{DATA}/stage3.dev",   "stage3 dev"),
+    ]
+
+    for file_path, name in stages:
+        if not os.path.exists(file_path):
+            print(f"SKIP {name}: not found at {file_path}")
+            continue
+        print(f"\n{'='*50}\nProcessing {name} …\n{'='*50}")
+        load_dataset(
+            input_file = file_path,
+            tokenizer  = tokenizer,
+            max_length = max_len,
+            use_cache  = True,
+        )
+        print(f"✓ {name} cached")
+
+    print("\n✓ All preprocessing done.")
+
+
+# ── Core training function (RTX 4090) ─────────────────────────────────────────
+
+@function(
+    image   = gector_image,
+    gpu     = "RTX4090",
+    cpu     = 8,
+    memory  = "32Gi",
+    volumes = [gector_volume],
+    timeout = 86400,             # 24 h — stage 1 can be long; set -1 to disable
+    secrets = [Secret(name="WANDB_API_KEY")],
+)
+def train_stage(
+    stage:              int,
+    model_id:           str   = "roberta-base",
+    restore_dir:        str   = None,
+    lr:                 float = 1e-5,
+    cold_lr:            float = 1e-3,
+    max_len:            int   = 80,
+    n_max_labels:       int   = 5000,
+    accumulation:       int   = 1,
+    label_smoothing:    float = 0.0,
+    num_warmup_steps:   int   = 500,
+    lr_scheduler_type:  str   = "constant",
+    seed:               int   = 10,
+    wandb_project:      str   = "gector",
+    wandb_run_name:     str   = None,
+):
+    """Launch one training stage inside the Beam container."""
+    import subprocess
+    import sys
+    import os
+
+    os.makedirs(HF_CACHE, exist_ok=True)
+    os.environ["HF_HOME"] = HF_CACHE
+
+    cfg      = STAGE_CFG[stage]
+    save_dir = cfg["save_dir"]
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Auto-restore from previous stage's best checkpoint
+    if restore_dir is None and stage > 1:
+        prev_best = STAGE_CFG[stage - 1]["save_dir"] + "/best"
+        if Path(prev_best).exists():
+            restore_dir = prev_best
+            print(f"Stage {stage}: restoring from {restore_dir}")
+        else:
+            print(
+                f"WARNING: expected checkpoint at {prev_best} but not found. "
+                "Training from scratch with --model-id."
+            )
+
+    run_name = wandb_run_name or f"stage{stage}_{model_id}"
+
+    cmd = [
+        sys.executable, "-m", "accelerate.commands.launch",
+        "--mixed_precision", "fp16",
+        "train.py",
+        "--train_file",        cfg["train_file"],
+        "--valid_file",        cfg["valid_file"],
+        "--save_dir",          save_dir,
+        "--batch_size",        str(cfg["batch_size"]),
+        "--n_cold_epochs",     str(cfg["n_cold_epochs"]),
+        "--n_epochs",          str(cfg["n_epochs"]),
+        "--ckpt_steps",        "500",
+        "--ckpt_limit",        "2",
+        "--resume_ckpt",       "auto",
+        "--lr",                str(lr),
+        "--cold_lr",           str(cold_lr),
+        "--max_len",           str(max_len),
+        "--n_max_labels",      str(n_max_labels),
+        "--accumulation",      str(accumulation),
+        "--label_smoothing",   str(label_smoothing),
+        "--num_warmup_steps",  str(num_warmup_steps),
+        "--lr_scheduler_type", lr_scheduler_type,
+        "--seed",              str(seed),
+        "--restore_vocab_official", VOCAB_DIR,
+        "--wandb_project",     wandb_project,
+        "--wandb_run_name",    run_name,
+    ]
+
+    if restore_dir:
+        cmd += ["--restore_dir", restore_dir]
+    else:
+        cmd += ["--model_id", model_id]
+
+    print(f"\n=== Stage {stage} command ===")
+    print(" ".join(cmd))
+
+    subprocess.run(cmd, check=True, env=os.environ.copy())
+
+    print(f"\n✓ Stage {stage} complete. Checkpoints saved to {save_dir}")
+    return save_dir
+
+
+# ── Local entrypoints (called from your machine) ───────────────────────────────
+
+def _maybe_override_batch(stage: int, batch_size: int):
+    if batch_size > 0:
+        STAGE_CFG[stage]["batch_size"] = batch_size
+
+
+def cmd_preprocess(args):
+    preprocess_all.remote(model_id=args.model_id, max_len=args.max_len)
+
+
+def cmd_stage(args, stage: int):
+    _maybe_override_batch(stage, args.batch_size)
+    save_dir = train_stage.remote(
+        stage       = stage,
+        model_id    = args.model_id,
+        restore_dir = args.restore_dir,
+        lr          = args.lr,
+        seed        = args.seed,
+    )
+    print(f"Stage {stage} done → {save_dir}")
+
+
+def cmd_download(args):
+    """
+    Copy a trained checkpoint from the Beam Volume to your local machine
+    using the Beam CLI.  Equivalent to:
+        beam cp beam://gector-data/checkpoints/stage<N>/<which> <local_dir>
+    """
+    import subprocess
+    remote = f"beam://{VOLUME_NAME}/checkpoints/stage{args.stage}/{args.which}"
+    local  = Path(args.local_dir)
+    local.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {remote} → {args.local_dir} …")
+    subprocess.run(
+        ["beam", "cp", remote, str(local)],
+        check=True
+    )
+    print("✓ Download complete.")
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="GECToR training on Beam Cloud"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # preprocess
+    p = sub.add_parser("preprocess", help="Tokenise & cache all datasets (CPU)")
+    p.add_argument("--model-id",  default="roberta-base")
+    p.add_argument("--max-len",   type=int, default=80)
+
+    # stage1 / stage2 / stage3  (share the same args)
+    for s in (1, 2, 3):
+        p = sub.add_parser(f"stage{s}", help=f"Train stage {s}")
+        p.add_argument("--model-id",    default="roberta-base")
+        p.add_argument("--restore-dir", default=None,
+                       help="Override checkpoint path (default: auto from previous stage)")
+        p.add_argument("--batch-size",  type=int, default=0,
+                       help="Override default batch size (0 = use default)")
+        p.add_argument("--lr",          type=float, default=1e-5)
+        p.add_argument("--seed",        type=int, default=10)
+
+    # download
+    p = sub.add_parser("download", help="Download a checkpoint to your local machine")
+    p.add_argument("--stage",     type=int, default=3)
+    p.add_argument("--which",     default="best", choices=["best", "last"])
+    p.add_argument("--local-dir", default="outputs/beam_checkpoint")
+
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args   = parser.parse_args()
+    cmd    = args.command
+
+    if cmd == "preprocess":
+        cmd_preprocess(args)
+    elif cmd == "stage1":
+        cmd_stage(args, 1)
+    elif cmd == "stage2":
+        cmd_stage(args, 2)
+    elif cmd == "stage3":
+        cmd_stage(args, 3)
+    elif cmd == "download":
+        cmd_download(args)
+    else:
+        parser.print_help()
+        sys.exit(1)

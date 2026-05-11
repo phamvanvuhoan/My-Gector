@@ -62,7 +62,6 @@ def train(
     global_step,          # <-- add
     ckpt_steps,  # <-- add
     save_dir,             # <-- add
-    volume,               # <-- add
     ckpt_limit, # <-- add
     resume_step=0,        # <-- add (only non-zero on first resumed epoch)
 ):
@@ -119,8 +118,6 @@ def train(
             ckpt_path = os.path.join(save_dir, f"checkpoint_{global_step}")  # <-- define it here
             accelerator.save_state(ckpt_path)   # all processes must call this
             if accelerator.is_main_process:
-                if volume is not None:
-                    volume.commit()
                 _prune_checkpoints(save_dir, ckpt_limit)
                 print(f"  [step {global_step}] checkpoint saved → {ckpt_path}")
 
