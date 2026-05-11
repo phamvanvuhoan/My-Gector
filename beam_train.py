@@ -11,9 +11,11 @@ Prerequisites
        beam volume create gector-data
 
 3. Upload your preprocessed data to the volume:
-       beam cp data/output_vocabulary  beam://gector-data/data/output_vocabulary
-       beam cp stage1.train            beam://gector-data/data/stage1.train
-       beam cp stage1.dev              beam://gector-data/data/stage1.dev
+       # Upload files to the volume root — Beam preserves the local filename.
+       # run setup_volume_beam.py to do all of this automatically.
+       beam cp data/output_vocabulary  beam://gector-data
+       beam cp data/stage1.train       beam://gector-data
+       beam cp data/stage1.dev         beam://gector-data
        # … repeat for stage2 / stage3 files
 
 4. Store your W&B API key as a Beam secret (once):
@@ -45,15 +47,17 @@ import os
 import sys
 from pathlib import Path
 
-from beam import Image, Volume, Secret, function
+from beam import Image, Volume, function
 
 # ── Shared volume / paths ──────────────────────────────────────────────────────
 
 VOLUME_NAME = "gector-data"
 MOUNT       = "./gector-data"          # Beam mounts at a relative path inside the container
 
-DATA        = f"{MOUNT}/data"
-VOCAB_DIR   = f"{DATA}/output_vocabulary"
+# Files are uploaded to the volume root via `beam cp <file> beam://gector-data`
+# so they land directly at MOUNT/<filename> — there is no extra data/ subfolder.
+DATA        = MOUNT
+VOCAB_DIR   = f"{MOUNT}/output_vocabulary"
 SAVE_BASE   = f"{MOUNT}/checkpoints"
 HF_CACHE    = f"{MOUNT}/hf_cache"
 CACHE_DIR   = f"{MOUNT}/cache"
@@ -117,7 +121,6 @@ gector_volume = Volume(name=VOLUME_NAME, mount_path=MOUNT)
     memory  = "32Gi",
     volumes = [gector_volume],
     timeout = 7200,
-    secrets = [Secret(name="WANDB_API_KEY")],
 )
 def preprocess_all(model_id: str = "roberta-base", max_len: int = 80):
     """
@@ -172,7 +175,7 @@ def preprocess_all(model_id: str = "roberta-base", max_len: int = 80):
     memory  = "32Gi",
     volumes = [gector_volume],
     timeout = 86400,             # 24 h — stage 1 can be long; set -1 to disable
-    secrets = [Secret(name="WANDB_API_KEY")],
+    secrets = ["WANDB_API_KEY"],
 )
 def train_stage(
     stage:              int,
