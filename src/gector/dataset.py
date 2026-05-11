@@ -131,36 +131,6 @@ def load_gector_format(
             srcs.append(src)
             word_level_labels.append(labels)
     return srcs, word_level_labels
-'''
-def load_dataset(
-    input_file: str,
-    tokenizer: PreTrainedTokenizer,
-    delimeter: str='SEPL|||SEPR',
-    additional_delimeter: str='SEPL__SEPR',
-    batch_size: int=50000, # avoid too heavy computation in the tokenization
-    max_length: int=128
-):
-    srcs, word_level_labels = load_gector_format(
-        input_file,
-        delimeter=delimeter,
-        additional_delimeter=additional_delimeter
-    )
-    d_labels, labels, word_masks = align_labels_to_subwords(
-        srcs,
-        word_level_labels,
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        max_length=max_length
-    )
-    return GECToRDataset(
-        srcs=srcs,
-        d_labels=d_labels,
-        labels=labels,
-        word_masks=word_masks,
-        tokenizer=tokenizer,
-        max_length=max_length
-    )
-'''
     
 import pickle
 import hashlib
