@@ -131,7 +131,7 @@ def load_gector_format(
             srcs.append(src)
             word_level_labels.append(labels)
     return srcs, word_level_labels
-
+'''
 def load_dataset(
     input_file: str,
     tokenizer: PreTrainedTokenizer,
@@ -160,5 +160,71 @@ def load_dataset(
         tokenizer=tokenizer,
         max_length=max_length
     )
+'''
     
-    
+import pickle
+import hashlib
+
+def _cache_path(input_file: str, tokenizer, max_length: int) -> str:
+    """Generate a unique cache filename based on file + tokenizer + config."""
+    # hash the tokenizer name and max_length so changing them invalidates cache
+    key = f"{input_file}_{tokenizer.name_or_path}_{max_length}"
+    h = hashlib.md5(key.encode()).hexdigest()[:8]
+    return input_file + f".cache_{h}.pkl"
+
+def load_dataset(
+    input_file: str,
+    tokenizer: PreTrainedTokenizer,
+    delimeter: str = 'SEPL|||SEPR',
+    additional_delimeter: str = 'SEPL__SEPR',
+    batch_size: int = 50000,
+    max_length: int = 128,
+    use_cache: bool = True,        # <-- add
+):
+    cache_file = _cache_path(input_file, tokenizer, max_length)
+
+    if use_cache and os.path.exists(cache_file):
+        print(f"Loading cached dataset from {cache_file} ...")
+        with open(cache_file, 'rb') as f:
+            data = pickle.load(f)
+        return GECToRDataset(
+            srcs       = data['srcs'],
+            d_labels   = data['d_labels'],
+            labels     = data['labels'],
+            word_masks = data['word_masks'],
+            tokenizer  = tokenizer,
+            max_length = max_length,
+        )
+
+    # cache miss — do the full preprocessing
+    srcs, word_level_labels = load_gector_format(
+        input_file,
+        delimeter=delimeter,
+        additional_delimeter=additional_delimeter
+    )
+    d_labels, labels, word_masks = align_labels_to_subwords(
+        srcs,
+        word_level_labels,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        max_length=max_length
+    )
+
+    if use_cache:
+        print(f"Saving dataset cache to {cache_file} ...")
+        with open(cache_file, 'wb') as f:
+            pickle.dump({
+                'srcs':       srcs,
+                'd_labels':   d_labels,
+                'labels':     labels,
+                'word_masks': word_masks,
+            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return GECToRDataset(
+        srcs       = srcs,
+        d_labels   = d_labels,
+        labels     = labels,
+        word_masks = word_masks,
+        tokenizer  = tokenizer,
+        max_length = max_length,
+    )

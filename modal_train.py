@@ -71,6 +71,75 @@ STAGE_CFG = {
     ),
 }
 
+# add this to modal_train.py
+
+@app.function(
+    image   = image,
+    cpu     = 8,           # more CPUs = faster tokenization
+    memory  = 32768,       # 32 GB — stage1 is 8.8M sentences
+    volumes = {MOUNT: volume},
+    timeout = 7200,        # 2 hours should be enough for all stages
+)
+def preprocess_all(
+    model_id:   str = "roberta-base",
+    max_len:    int = 80,
+):
+    """
+    Tokenize and cache all stage datasets on CPU.
+    Run this ONCE before any training stage.
+
+    Usage:
+        modal run modal_train.py::preprocess_all
+        modal run modal_train.py::preprocess_all --model-id bert-base-cased
+    """
+    import os
+    from transformers import AutoTokenizer
+    from gector import load_dataset
+
+    cache_dir = f"{MOUNT}/cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["GECTOR_CACHE_DIR"] = cache_dir
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        add_prefix_space=True
+    )
+    tokenizer.add_special_tokens(
+        {'additional_special_tokens': ['$START']}
+    )
+
+    stages = [
+        (f"{MOUNT}/data/stage1.train", "stage1 train"),
+        (f"{MOUNT}/data/stage1.dev",   "stage1 dev"),
+        (f"{MOUNT}/data/stage2.train", "stage2 train"),
+        (f"{MOUNT}/data/stage2.dev",   "stage2 dev"),
+        (f"{MOUNT}/data/stage3.train", "stage3 train"),
+        (f"{MOUNT}/data/stage3.dev",   "stage3 dev"),
+    ]
+
+    for file_path, name in stages:
+        if not os.path.exists(file_path):
+            print(f"SKIP {name}: file not found at {file_path}")
+            continue
+
+        print(f"\n{'='*50}")
+        print(f"Processing {name} ...")
+        print(f"{'='*50}")
+
+        load_dataset(
+            input_file = file_path,
+            tokenizer  = tokenizer,
+            max_length = max_len,
+            use_cache  = True,
+        )
+
+        # flush to volume after each file so partial progress is saved
+        # if this function gets interrupted
+        volume.commit()
+        print(f"✓ {name} cached and committed to volume")
+
+    print("\n✓ All preprocessing done. Ready to train.")
+
 # ── Core training function (runs on Modal GPU) ─────────────────────────────────
 MAX_RETRIES = 10   # Modal preempts at most this many times before we give up
 
@@ -162,6 +231,13 @@ def train_stage(
 
 
 # ── Per-stage entrypoints ──────────────────────────────────────────────────────
+
+@app.local_entrypoint()
+def preprocess(
+    model_id: str = "roberta-base",
+    max_len:  int = 80,
+):
+    preprocess_all.remote(model_id=model_id, max_len=max_len)
 
 @app.local_entrypoint()
 def run_stage1(

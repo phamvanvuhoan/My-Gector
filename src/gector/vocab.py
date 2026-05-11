@@ -57,7 +57,7 @@ def compute_class_weights(
     Returns a weight tensor of shape (num_labels - 1,)
     The -1 matches label_proj_layer which excludes <PAD>.
     """
-    freq, _ = train_dataset.get_labels_freq(excluded_labels=['<PAD>'])
+    freq, _ = train_dataset.get_labels_freq(exluded_labels=['<PAD>'])
     
     n_labels = len(label2id)
     counts = torch.zeros(n_labels)
