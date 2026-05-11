@@ -31,7 +31,9 @@ image = (
         "accelerate>=1.3.0",
         "huggingface-hub>=0.28.1",
         "python-levenshtein>=0.26.1",
-        "git+https://github.com/phamvanvuhoan/My-Gector.git",
+    )
+    .run_commands(
+        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
     )
     .add_local_file("train.py", "/root/train.py")   # <-- add this
 )
