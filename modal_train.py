@@ -149,6 +149,7 @@ MAX_RETRIES = 10   # Modal preempts at most this many times before we give up
 @app.function(
     image   = image,
     gpu     = GPU,
+    cpu     = 8,           # more CPUs = faster data loading
     volumes = {MOUNT: volume},
     timeout = 86400,   # 24 h — stage 1 can be long
     secrets = [modal.Secret.from_name("wandb-secret")],   # <-- add
@@ -174,6 +175,10 @@ def train_stage(
 ):
     """Launches one training stage inside the Modal container."""
     import subprocess, sys, json
+
+    # at the top of train_stage() in modal_train.py, before subprocess.run()
+    os.environ["HF_HOME"] = f"{MOUNT}/hf_cache"
+    os.makedirs(f"{MOUNT}/hf_cache", exist_ok=True)
 
     cfg = STAGE_CFG[stage]
     save_dir = cfg["save_dir"]
@@ -231,7 +236,10 @@ def train_stage(
     print(" ".join(cmd))
     print()
 
-    result = subprocess.run(cmd, check=True)
+    env = os.environ.copy()
+    env["HF_HOME"] = f"{MOUNT}/hf_cache"
+
+    result = subprocess.run(cmd, check=True, env=env)
 
     # Commit volume writes so next stage / download can see them
     volume.commit()

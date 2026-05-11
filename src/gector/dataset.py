@@ -13,7 +13,9 @@ class GECToRDataset:
         labels: List[List[int]]=None,
         word_masks: List[List[int]]=None,
         tokenizer: PreTrainedTokenizer=None,
-        max_length:int=128
+        max_length:int=128,
+        input_ids=None,        # <-- add
+        attention_masks=None,  # <-- add
     ):
         self.tokenizer = tokenizer
         self.srcs = srcs
@@ -23,6 +25,8 @@ class GECToRDataset:
         self.max_length = max_length
         self.label2id = None
         self.d_label2id = None
+        self.input_ids = input_ids
+        self.attention_masks = attention_masks
         
     def __len__(self):
         return len(self.srcs)
@@ -32,17 +36,28 @@ class GECToRDataset:
         d_labels = self.d_labels[idx]
         labels = self.labels[idx]
         wmask = self.word_masks[idx]
-        encode = self.tokenizer(
-            src,
-            return_tensors='pt',
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            is_split_into_words=True
-        )
+
+        if self.input_ids is not None:
+            # fast path — no tokenization needed
+            input_ids      = torch.tensor(self.input_ids[idx])
+            attention_mask = torch.tensor(self.attention_masks[idx])
+        else:
+            # fallback for backward compat
+            src    = self.srcs[idx]
+            encode = self.tokenizer(
+                src,
+                return_tensors='pt',
+                max_length=self.max_length,
+                padding='max_length',
+                truncation=True,
+                is_split_into_words=True
+            )
+            input_ids      = encode['input_ids'].squeeze()
+            attention_mask = encode['attention_mask'].squeeze()
+
         return {
-            'input_ids': encode['input_ids'].squeeze(),
-            'attention_mask': encode['attention_mask'].squeeze(),
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
             'd_labels': torch.tensor(d_labels).squeeze(),
             'labels': torch.tensor(labels).squeeze(),
             'word_masks': torch.tensor(wmask).squeeze()
@@ -76,6 +91,8 @@ def align_labels_to_subwords(
     subword_labels = []
     subword_d_labels = []
     word_masks = []
+    input_ids_list = []
+    attention_masks_list = []
     for i in tqdm(itr):
         encode = tokenizer(
             srcs[i:i+batch_size],
@@ -85,6 +102,9 @@ def align_labels_to_subwords(
             truncation=True,
             is_split_into_words=True
         )
+        # store as numpy to save memory vs raw tensors
+        input_ids_list.extend(encode['input_ids'].numpy())
+        attention_masks_list.extend(encode['attention_mask'].numpy())
         for i, wlabels in enumerate(word_labels[i:i+batch_size]):
             d_labels = []
             labels = []
@@ -112,7 +132,7 @@ def align_labels_to_subwords(
             subword_d_labels.append(d_labels)
             subword_labels.append(labels)
             word_masks.append(wmask)
-    return subword_d_labels, subword_labels, word_masks
+    return subword_d_labels, subword_labels, word_masks, input_ids_list, attention_masks_list
         
 def load_gector_format(
     input_file: str,
@@ -172,7 +192,7 @@ def load_dataset(
         delimeter=delimeter,
         additional_delimeter=additional_delimeter
     )
-    d_labels, labels, word_masks = align_labels_to_subwords(
+    d_labels, labels, word_masks, input_ids_list, attention_masks_list = align_labels_to_subwords(
         srcs,
         word_level_labels,
         tokenizer=tokenizer,
@@ -188,6 +208,8 @@ def load_dataset(
                 'd_labels':   d_labels,
                 'labels':     labels,
                 'word_masks': word_masks,
+                'input_ids':      input_ids_list,      # <-- add
+                'attention_masks': attention_masks_list, # <-- add
             }, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     return GECToRDataset(
@@ -195,6 +217,8 @@ def load_dataset(
         d_labels   = d_labels,
         labels     = labels,
         word_masks = word_masks,
+        input_ids = input_ids_list,
+        attention_masks = attention_masks_list,
         tokenizer  = tokenizer,
         max_length = max_length,
     )
