@@ -104,7 +104,7 @@ def train(
                 lr=optimizer.param_groups[0]['lr']
             ))
             # ── W&B step log ─────────────────────────────────────
-            if wandb.run is not None:
+            if wandb.run is not None and global_step % 50 ==0:
                 wandb.log({
                     'train/loss':       loss.item(),
                     'train/accuracy':   outputs.accuracy.item(),
@@ -163,8 +163,9 @@ def main(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms = True
+    #torch.backends.cudnn.deterministic = True
+    #torch.use_deterministic_algorithms = True
+    torch.backends.cudnn.benchmark = True
 
     accelerator = Accelerator(gradient_accumulation_steps=args.accumulation,
                               project_dir=args.save_dir,
@@ -257,16 +258,16 @@ def main(args):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,        # <-- add
+        num_workers=16,        # <-- add
         pin_memory=True,      # <-- add, faster CPU→GPU transfer
-        prefetch_factor=2,    # <-- prefetch 2 batches per worker
+        prefetch_factor=4,    # <-- prefetch 2 batches per worker
         persistent_workers=True,  # <-- keep workers alive between epochs
     )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=16,
         pin_memory=True,
         persistent_workers=True,
     )

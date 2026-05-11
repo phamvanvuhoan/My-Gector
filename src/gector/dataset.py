@@ -8,73 +8,82 @@ from transformers import PreTrainedTokenizer
 class GECToRDataset:
     def __init__(
         self,
-        srcs: List[str],
-        d_labels: List[List[int]]=None,
-        labels: List[List[int]]=None,
-        word_masks: List[List[int]]=None,
-        tokenizer: PreTrainedTokenizer=None,
-        max_length:int=128,
-        input_ids=None,        # <-- add
-        attention_masks=None,  # <-- add
+        srcs,
+        d_labels=None,
+        labels=None,
+        word_masks=None,
+        tokenizer=None,
+        max_length=128,
+        input_ids=None,
+        attention_masks=None,
     ):
-        self.tokenizer = tokenizer
-        self.srcs = srcs
-        self.d_labels = d_labels
-        self.labels = labels
+        self.tokenizer     = tokenizer
+        self.srcs          = srcs
+        self.max_length    = max_length
+        self.label2id      = None
+        self.d_label2id    = None
+
+        # convert everything to tensors ONCE here, not in __getitem__
+        if input_ids is not None:
+            self.input_ids      = input_ids if isinstance(input_ids, torch.Tensor) \
+                                  else torch.tensor(input_ids,      dtype=torch.long)
+            self.attention_masks = attention_masks if isinstance(attention_masks, torch.Tensor) \
+                                  else torch.tensor(attention_masks, dtype=torch.long)
+        else:
+            self.input_ids       = None
+            self.attention_masks = None
+
+        # labels stay as lists until append_vocab() converts them,
+        # so we defer tensor conversion to after append_vocab()
+        self.d_labels  = d_labels
+        self.labels    = labels
         self.word_masks = word_masks
-        self.max_length = max_length
-        self.label2id = None
-        self.d_label2id = None
-        self.input_ids = input_ids
-        self.attention_masks = attention_masks
-        
+
+    def _labels_to_tensors(self):
+        """Call once after append_vocab() to lock everything into tensors."""
+        self.labels    = torch.tensor(self.labels,    dtype=torch.long)
+        self.d_labels  = torch.tensor(self.d_labels,  dtype=torch.long)
+        self.word_masks = torch.tensor(self.word_masks, dtype=torch.long)
+
+    def append_vocab(self, label2id, d_label2id):
+        self.label2id   = label2id
+        self.d_label2id = d_label2id
+        for i in range(len(self.labels)):
+            self.labels[i]   = [label2id.get(l, label2id['<OOV>']) for l in self.labels[i]]
+            self.d_labels[i] = [d_label2id[l] for l in self.d_labels[i]]
+        # convert to tensors immediately after vocab is applied
+        self._labels_to_tensors()
+
     def __len__(self):
         return len(self.srcs)
 
     def __getitem__(self, idx):
-        src = self.srcs[idx]
-        d_labels = self.d_labels[idx]
-        labels = self.labels[idx]
-        wmask = self.word_masks[idx]
-
+        # ZERO tensor construction — pure tensor indexing only
         if self.input_ids is not None:
-            # fast path — no tokenization needed
-            input_ids      = torch.tensor(self.input_ids[idx])
-            attention_mask = torch.tensor(self.attention_masks[idx])
-        else:
-            # fallback for backward compat
-            src    = self.srcs[idx]
-            encode = self.tokenizer(
-                src,
-                return_tensors='pt',
-                max_length=self.max_length,
-                padding='max_length',
-                truncation=True,
-                is_split_into_words=True
-            )
-            input_ids      = encode['input_ids'].squeeze()
-            attention_mask = encode['attention_mask'].squeeze()
-
+            return {
+                'input_ids':      self.input_ids[idx],
+                'attention_mask': self.attention_masks[idx],
+                'd_labels':       self.d_labels[idx],
+                'labels':         self.labels[idx],
+                'word_masks':     self.word_masks[idx],
+            }
+        # fallback if no cached input_ids (backward compat)
+        src    = self.srcs[idx]
+        encode = self.tokenizer(
+            src,
+            return_tensors='pt',
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            is_split_into_words=True
+        )
         return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'd_labels': torch.tensor(d_labels).squeeze(),
-            'labels': torch.tensor(labels).squeeze(),
-            'word_masks': torch.tensor(wmask).squeeze()
+            'input_ids':      encode['input_ids'].squeeze(),
+            'attention_mask': encode['attention_mask'].squeeze(),
+            'd_labels':       self.d_labels[idx],
+            'labels':         self.labels[idx],
+            'word_masks':     self.word_masks[idx],
         }
-
-    def append_vocab(self, label2id, d_label2id):
-        self.label2id = label2id
-        self.d_label2id = d_label2id
-        for i in range(len(self.labels)):
-            self.labels[i] = [self.label2id.get(l, self.label2id['<OOV>']) for l in self.labels[i]]
-            self.d_labels[i] = [self.d_label2id[l] for l in self.d_labels[i]]
-    
-    def get_labels_freq(self, exluded_labels: List[str] = []):
-        assert(self.labels is not None and self.d_labels is not None)
-        flatten_labels = [ll for l in self.labels for ll in l if ll not in exluded_labels]
-        flatten_d_labels = [ll for l in self.d_labels for ll in l if ll not in exluded_labels]
-        return Counter(flatten_labels), Counter(flatten_d_labels)
 
 def align_labels_to_subwords(
     srcs: List[str],
@@ -91,8 +100,8 @@ def align_labels_to_subwords(
     subword_labels = []
     subword_d_labels = []
     word_masks = []
-    input_ids_list = []
-    attention_masks_list = []
+    all_input_ids = []
+    all_attention_masks = []
     for i in tqdm(itr):
         encode = tokenizer(
             srcs[i:i+batch_size],
@@ -102,9 +111,10 @@ def align_labels_to_subwords(
             truncation=True,
             is_split_into_words=True
         )
-        # store as numpy to save memory vs raw tensors
-        input_ids_list.extend(encode['input_ids'].numpy())
-        attention_masks_list.extend(encode['attention_mask'].numpy())
+        # store as tensors, not numpy
+        all_input_ids.append(encode['input_ids'])
+        all_attention_masks.append(encode['attention_mask'])
+
         for i, wlabels in enumerate(word_labels[i:i+batch_size]):
             d_labels = []
             labels = []
@@ -132,8 +142,13 @@ def align_labels_to_subwords(
             subword_d_labels.append(d_labels)
             subword_labels.append(labels)
             word_masks.append(wmask)
-    return subword_d_labels, subword_labels, word_masks, input_ids_list, attention_masks_list
-        
+    
+    # cat all batches into single tensors
+    input_ids_tensor      = torch.cat(all_input_ids,      dim=0)
+    attention_masks_tensor = torch.cat(all_attention_masks, dim=0)
+
+    return subword_d_labels, subword_labels, word_masks, input_ids_tensor, attention_masks_tensor
+
 def load_gector_format(
     input_file: str,
     delimeter: str='SEPL|||SEPR',
@@ -175,15 +190,16 @@ def load_dataset(
 
     if use_cache and os.path.exists(cache_file):
         print(f"Loading cached dataset from {cache_file} ...")
-        with open(cache_file, 'rb') as f:
-            data = pickle.load(f)
+        data = torch.load(cache_file)
         return GECToRDataset(
-            srcs       = data['srcs'],
-            d_labels   = data['d_labels'],
-            labels     = data['labels'],
-            word_masks = data['word_masks'],
-            tokenizer  = tokenizer,
-            max_length = max_length,
+            srcs            = data['srcs'],
+            d_labels        = data['d_labels'],
+            labels          = data['labels'],
+            word_masks      = data['word_masks'],
+            input_ids       = data['input_ids'],
+            attention_masks = data['attention_masks'],
+            tokenizer       = tokenizer,
+            max_length      = max_length,
         )
 
     # cache miss — do the full preprocessing
@@ -192,7 +208,7 @@ def load_dataset(
         delimeter=delimeter,
         additional_delimeter=additional_delimeter
     )
-    d_labels, labels, word_masks, input_ids_list, attention_masks_list = align_labels_to_subwords(
+    d_labels, labels, word_masks, input_ids, attention_masks = align_labels_to_subwords(
         srcs,
         word_level_labels,
         tokenizer=tokenizer,
@@ -201,24 +217,23 @@ def load_dataset(
     )
 
     if use_cache:
-        print(f"Saving dataset cache to {cache_file} ...")
-        with open(cache_file, 'wb') as f:
-            pickle.dump({
-                'srcs':       srcs,
-                'd_labels':   d_labels,
-                'labels':     labels,
-                'word_masks': word_masks,
-                'input_ids':      input_ids_list,      # <-- add
-                'attention_masks': attention_masks_list, # <-- add
-            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Saving cache to {cache_file} ...")
+        torch.save({               # torch.save handles tensors better than pickle
+            'srcs':            srcs,
+            'd_labels':        d_labels,
+            'labels':          labels,
+            'word_masks':      word_masks,
+            'input_ids':       input_ids,        # already a tensor
+            'attention_masks': attention_masks,   # already a tensor
+        }, cache_file)
 
     return GECToRDataset(
-        srcs       = srcs,
-        d_labels   = d_labels,
-        labels     = labels,
-        word_masks = word_masks,
-        input_ids = input_ids_list,
-        attention_masks = attention_masks_list,
-        tokenizer  = tokenizer,
-        max_length = max_length,
+        srcs            = srcs,
+        d_labels        = d_labels,
+        labels          = labels,
+        word_masks      = word_masks,
+        input_ids       = input_ids,
+        attention_masks = attention_masks,
+        tokenizer       = tokenizer,
+        max_length      = max_length,
     )
