@@ -363,22 +363,33 @@ def load_dataset(
     cache_key      = _cache_key(input_file, tokenizer, max_length)
     manifest_file  = _manifest_path(input_file, cache_key)
 
-    # ── Cache hit: all shards already exist ───────────────────────────────────
+    # ── Cache hit: manifest exists ───────────────────────────────────────────
     if use_cache and os.path.exists(manifest_file):
-        print(f"Loading sharded cache from manifest {manifest_file} …")
+        print(f"Found manifest {manifest_file} …")
         manifest = torch.load(manifest_file, weights_only=False)
-        # Verify every shard still exists (partial runs leave gaps)
-        missing = [p for p in manifest['shard_paths'] if not os.path.exists(p)]
-        if missing:
-            print(f"  {len(missing)} shard(s) missing — rebuilding from scratch.")
-        elif 'shard_lengths' not in manifest:
+
+        if 'shard_lengths' not in manifest:
             print("  Manifest missing shard_lengths (old format) — rebuilding.")
         else:
-            if not load_after_cache:
-                return None
-            return _load_shards(manifest, tokenizer, max_length)
+            missing = [p for p in manifest['shard_paths'] if not os.path.exists(p)]
+            if not missing:
+                # All shards present — fast path
+                print(f"  All {len(manifest['shard_paths'])} shards present.")
+                if not load_after_cache:
+                    return None
+                return _load_shards(manifest, tokenizer, max_length)
+            else:
+                # Some shards missing — parse the source file but skip
+                # existing shards; only recompute the missing ones.
+                print(f"  {len(missing)} shard(s) missing — will recompute only those.")
+                # Fall through to the shard loop below with _existing_manifest
+                _existing_manifest = manifest
 
-    # ── Cache miss: parse the raw file ────────────────────────────────────────
+    # ── Partial or full recompute ─────────────────────────────────────────────
+    # _existing_manifest is set when the manifest existed but some shards were
+    # missing. In that case we parse the source file but skip existing shards.
+    _existing_manifest = locals().get('_existing_manifest', None)
+
     print(f"Parsing {input_file} …")
     all_srcs, all_word_labels = load_gector_format(
         input_file,
@@ -392,17 +403,28 @@ def load_dataset(
     shard_lengths = []   # built during loop — no re-opening shards later
     n_shards      = (n_total + shard_size - 1) // shard_size
 
+    # Build a fast lookup of which shard indices are already cached
+    # — either from the existing manifest or from the file system
+    if _existing_manifest:
+        existing_shard_paths = set(_existing_manifest['shard_paths'])
+    else:
+        existing_shard_paths = set()
+
     for shard_idx in range(n_shards):
         shard_file = _shard_path(input_file, cache_key, shard_idx)
 
-        # Skip already-saved shards so a mid-run crash is resumable
-        if use_cache and os.path.exists(shard_file):
-            print(f"  Shard {shard_idx+1}/{n_shards} already cached — skipping.")
-            shard_paths.append(shard_file)
-            # Read only the scalar 'n' — torch.load still loads the full file,
-            # so we derive length from shard boundaries instead
-            shard_lengths.append(min(shard_size, n_total - shard_idx * shard_size))
-            continue
+        # Skip already-saved shards so a mid-run crash is resumable,
+        # AND skip shards that are confirmed present in an existing manifest
+        shard_file_str = str(shard_file)
+        if use_cache and (os.path.exists(shard_file) or shard_file_str in existing_shard_paths):
+            if not os.path.exists(shard_file):
+                # Listed in manifest but file actually gone — must recompute
+                print(f"  Shard {shard_idx+1}/{n_shards} listed in manifest but missing on disk — recomputing.")
+            else:
+                print(f"  Shard {shard_idx+1}/{n_shards} already cached — skipping.")
+                shard_paths.append(shard_file)
+                shard_lengths.append(min(shard_size, n_total - shard_idx * shard_size))
+                continue
 
         lo = shard_idx * shard_size
         hi = min(lo + shard_size, n_total)
