@@ -193,6 +193,7 @@ def _save_shard(
 ):
     torch.save({
         'srcs':            srcs,
+        'n':               len(srcs),   # cached length — __init__ reads this, never reopens tensors
         'd_labels':        d_labels,
         'labels':          labels,
         'word_masks':      word_masks,
@@ -215,27 +216,21 @@ class ShardedGECToRDataset(torch.utils.data.Dataset):
     stored back into each shard file so subsequent epochs skip re-conversion.
     """
 
-    def __init__(self, shard_paths: list, tokenizer, max_length: int):
+    def __init__(self, shard_paths: list, shard_lengths: list, tokenizer, max_length: int):
         self.shard_paths  = shard_paths
         self.tokenizer    = tokenizer
         self.max_length   = max_length
         self.label2id     = None
         self.d_label2id   = None
 
-        # Build a cumulative index so __getitem__ can map global idx → shard
-        self._shard_sizes  = []
-        self._cum_sizes    = []   # cumulative, len = n_shards + 1
-        cum = 0
-        self._cum_sizes.append(0)
-        for p in shard_paths:
-            # Peek at just the srcs list to get length without loading tensors
-            data = torch.load(p, weights_only=False)
-            n = len(data['srcs'])
-            self._shard_sizes.append(n)
-            cum += n
-            self._cum_sizes.append(cum)
+        # Lengths come from the manifest — we never open a shard file here.
+        # Opening all 18 shards just to count rows was the OOM that crashed at shard 8.
+        self._shard_sizes = shard_lengths
+        self._cum_sizes   = [0]
+        for n in shard_lengths:
+            self._cum_sizes.append(self._cum_sizes[-1] + n)
 
-        # Cache for the currently loaded shard
+        # Cache for the currently loaded shard (only one lives in RAM at a time)
         self._cached_shard_idx  = -1
         self._cached_shard_data = None
 
@@ -312,10 +307,41 @@ def _load_shards(manifest: dict, tokenizer, max_length: int) -> ShardedGECToRDat
     """Return a lazy ShardedGECToRDataset — no tensors are cat'd in RAM."""
     print(f"  Building lazy ShardedGECToRDataset over "
           f"{len(manifest['shard_paths'])} shards …")
-    return ShardedGECToRDataset(manifest['shard_paths'], tokenizer, max_length)
+    return ShardedGECToRDataset(
+        shard_paths   = manifest['shard_paths'],
+        shard_lengths = manifest['shard_lengths'],   # read from manifest, never open shards
+        tokenizer     = tokenizer,
+        max_length    = max_length,
+    )
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
+def preprocess_dataset(
+    input_file: str,
+    tokenizer: PreTrainedTokenizer,
+    delimeter: str = 'SEPL|||SEPR',
+    additional_delimeter: str = 'SEPL__SEPR',
+    batch_size: int = 50000,
+    max_length: int = 128,
+    shard_size: int = SHARD_SIZE,
+) -> None:
+    """
+    Tokenise and cache a dataset to shards. Does NOT load anything into RAM.
+    Call this from the preprocessing job.
+    """
+    load_dataset(
+        input_file           = input_file,
+        tokenizer            = tokenizer,
+        delimeter            = delimeter,
+        additional_delimeter = additional_delimeter,
+        batch_size           = batch_size,
+        max_length           = max_length,
+        use_cache            = True,
+        shard_size           = shard_size,
+        load_after_cache     = False,   # preprocess only — skip the RAM load
+    )
+
 
 def load_dataset(
     input_file: str,
@@ -326,13 +352,13 @@ def load_dataset(
     max_length: int = 128,
     use_cache: bool = True,
     shard_size: int = SHARD_SIZE,
-) -> 'GECToRDataset | ShardedGECToRDataset':
+    load_after_cache: bool = True,   # set False in preprocess to skip RAM load
+) -> 'ShardedGECToRDataset | None':
     """
-    Load a GECToR-format dataset with sharded caching.
+    Tokenise, cache, and (optionally) load a dataset.
 
-    Each shard of `shard_size` sentences is tokenised and saved independently,
-    so peak RAM never exceeds one shard worth of tensors at a time.
-    This prevents the silent OOM kill that occurred at ~26% of stage1.
+    load_after_cache=True  (default): tokenise → save shards → return ShardedGECToRDataset
+    load_after_cache=False (preprocess only): tokenise → save shards → return None
     """
     cache_key      = _cache_key(input_file, tokenizer, max_length)
     manifest_file  = _manifest_path(input_file, cache_key)
@@ -343,9 +369,14 @@ def load_dataset(
         manifest = torch.load(manifest_file, weights_only=False)
         # Verify every shard still exists (partial runs leave gaps)
         missing = [p for p in manifest['shard_paths'] if not os.path.exists(p)]
-        if not missing:
+        if missing:
+            print(f"  {len(missing)} shard(s) missing — rebuilding from scratch.")
+        elif 'shard_lengths' not in manifest:
+            print("  Manifest missing shard_lengths (old format) — rebuilding.")
+        else:
+            if not load_after_cache:
+                return None
             return _load_shards(manifest, tokenizer, max_length)
-        print(f"  {len(missing)} shard(s) missing — rebuilding from scratch.")
 
     # ── Cache miss: parse the raw file ────────────────────────────────────────
     print(f"Parsing {input_file} …")
@@ -357,8 +388,9 @@ def load_dataset(
     n_total = len(all_srcs)
     print(f"  {n_total:,} sentences loaded.")
 
-    shard_paths = []
-    n_shards    = (n_total + shard_size - 1) // shard_size
+    shard_paths   = []
+    shard_lengths = []   # built during loop — no re-opening shards later
+    n_shards      = (n_total + shard_size - 1) // shard_size
 
     for shard_idx in range(n_shards):
         shard_file = _shard_path(input_file, cache_key, shard_idx)
@@ -367,6 +399,9 @@ def load_dataset(
         if use_cache and os.path.exists(shard_file):
             print(f"  Shard {shard_idx+1}/{n_shards} already cached — skipping.")
             shard_paths.append(shard_file)
+            # Read only the scalar 'n' — torch.load still loads the full file,
+            # so we derive length from shard boundaries instead
+            shard_lengths.append(min(shard_size, n_total - shard_idx * shard_size))
             continue
 
         lo = shard_idx * shard_size
@@ -397,12 +432,17 @@ def load_dataset(
             import gc; gc.collect()
 
         shard_paths.append(shard_file)
+        shard_lengths.append(hi - lo)
 
-    # Write manifest so future runs skip everything
+    # Write manifest — lengths were collected during the loop, no re-opening needed
     if use_cache:
-        torch.save({'shard_paths': shard_paths}, manifest_file)
+        torch.save(
+            {'shard_paths': shard_paths, 'shard_lengths': shard_lengths},
+            manifest_file
+        )
         print(f"\n✓ All {n_shards} shards cached. Manifest → {manifest_file}")
 
-    print("Loading all shards into memory …")
-    manifest = {'shard_paths': shard_paths}
+    manifest = {'shard_paths': shard_paths, 'shard_lengths': shard_lengths}
+    if not load_after_cache:
+        return None   # preprocess path — don't load tensors into RAM
     return _load_shards(manifest, tokenizer, max_length)

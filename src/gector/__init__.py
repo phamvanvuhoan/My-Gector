@@ -13,6 +13,7 @@ __all__ = [
     'GECToR',
     'GECToRConfig',
     'load_dataset',
+    'preprocess_dataset',
     'GECToRDataset',
     'predict',
     'load_verb_dict',

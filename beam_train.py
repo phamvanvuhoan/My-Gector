@@ -139,7 +139,7 @@ def preprocess_all(
     import os
     import psutil
     from transformers import AutoTokenizer
-    from gector import load_dataset
+    from gector import preprocess_dataset
 
     def log_mem(tag: str):
         mb = psutil.Process().memory_info().rss / 1e6
@@ -168,11 +168,10 @@ def preprocess_all(
             continue
         print(f"\n{'='*50}\nProcessing {name} …\n{'='*50}")
         log_mem("before")
-        load_dataset(
+        preprocess_dataset(
             input_file = file_path,
             tokenizer  = tokenizer,
             max_length = max_len,
-            use_cache  = True,
             shard_size = shard_size,
         )
         log_mem("after")
