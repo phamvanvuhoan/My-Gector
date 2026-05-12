@@ -47,7 +47,7 @@ import os
 import sys
 from pathlib import Path
 
-from beam import Image, Volume, endpoint
+from beam import Image, Volume, function
 
 # ── Shared volume / paths ──────────────────────────────────────────────────────
 
@@ -110,12 +110,12 @@ gector_image = (
     ])
 )
 
-# Beam Volume object — attached to every endpoint below
+# Beam Volume object — attached to every function below
 gector_volume = Volume(name=VOLUME_NAME, mount_path=MOUNT)
 
 # ── Preprocessing (CPU-only) ───────────────────────────────────────────────────
 
-@endpoint(
+@function(
     image   = gector_image,
     cpu     = 8,
     memory  = "64Gi",   # stage1 has 8.8M sentences; 32 Gi OOM-killed at ~26%
@@ -181,9 +181,9 @@ def preprocess_all(
     print("\n✓ All preprocessing done.")
 
 
-# ── Core training endpoint (RTX 4090) ─────────────────────────────────────────
+# ── Core training function (RTX 4090) ─────────────────────────────────────────
 
-@endpoint(
+@function(
     image   = gector_image,
     gpu     = "RTX4090",
     cpu     = 8,
