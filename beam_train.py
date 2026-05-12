@@ -47,7 +47,7 @@ import os
 import sys
 from pathlib import Path
 
-from beam import Image, Volume, function
+from beam import Image, Volume, function, task_queue
 
 # ── Shared volume / paths ──────────────────────────────────────────────────────
 
@@ -115,9 +115,9 @@ gector_volume = Volume(name=VOLUME_NAME, mount_path=MOUNT)
 
 # ── Preprocessing (CPU-only) ───────────────────────────────────────────────────
 
-@function(
+@task_queue(
     image   = gector_image,
-    cpu     = 4,
+    cpu     = 8,
     memory  = "64Gi",   # stage1 has 8.8M sentences; 32 Gi OOM-killed at ~26%
     volumes = [gector_volume],
     timeout = 14400,    # 4 h — sharded processing of stage1 takes longer
@@ -183,7 +183,7 @@ def preprocess_all(
 
 # ── Core training function (RTX 4090) ─────────────────────────────────────────
 
-@function(
+@task_queue(
     image   = gector_image,
     gpu     = "RTX4090",
     cpu     = 8,
@@ -282,51 +282,48 @@ def _maybe_override_batch(stage: int, batch_size: int):
         STAGE_CFG[stage]["batch_size"] = batch_size
 
 
-def cmd_preprocess(args):
-    if args.detach:
-        # Fire-and-forget: .remote() returns immediately; job keeps running on Beam
-        # even after you close the terminal. Check progress with:
-        #   beam logs <task-id>
-        task = preprocess_all.remote(
-            model_id   = args.model_id,
-            max_len    = args.max_len,
-            shard_size = args.shard_size,
-            _detach    = True,           # Beam SDK flag: don't wait for result
-        )
-        print(f"✓ Preprocessing dispatched in detached mode.")
-        print(f"  Monitor with:  beam logs {task.id}")
-        print(f"  Cancel with:   beam cancel {task.id}")
+def _dispatch(fn, kwargs: dict, detach: bool, label: str):
+    """
+    Dispatch a task_queue function.
+
+    detach=True  → .put() and return immediately (terminal-safe).
+    detach=False → .put() then block by calling .remote() so output streams
+                   to your terminal as before.
+
+    task_queue functions use .put() to enqueue; the task runs on Beam
+    regardless of whether your local process stays alive.
+    """
+    if detach:
+        task = fn.put(**kwargs)
+        print(f"✓ {label} dispatched (detached).")
+        print(f"  Task ID : {task.id}")
+        print(f"  Monitor : beam logs {task.id}")
+        print(f"  Cancel  : beam cancel {task.id}")
     else:
-        preprocess_all.remote(
-            model_id   = args.model_id,
-            max_len    = args.max_len,
-            shard_size = args.shard_size,
-        )
+        # .put() enqueues, then we wait by calling the synchronous path
+        # task_queue doesn't block on .put(), so use .remote() for blocking
+        fn.remote(**kwargs)
+
+
+def cmd_preprocess(args):
+    kwargs = dict(
+        model_id   = args.model_id,
+        max_len    = args.max_len,
+        shard_size = args.shard_size,
+    )
+    _dispatch(preprocess_all, kwargs, args.detach, "Preprocessing")
 
 
 def cmd_stage(args, stage: int):
     _maybe_override_batch(stage, args.batch_size)
-    if args.detach:
-        task = train_stage.remote(
-            stage       = stage,
-            model_id    = args.model_id,
-            restore_dir = args.restore_dir,
-            lr          = args.lr,
-            seed        = args.seed,
-            _detach     = True,
-        )
-        print(f"✓ Stage {stage} dispatched in detached mode.")
-        print(f"  Monitor with:  beam logs {task.id}")
-        print(f"  Cancel with:   beam cancel {task.id}")
-    else:
-        save_dir = train_stage.remote(
-            stage       = stage,
-            model_id    = args.model_id,
-            restore_dir = args.restore_dir,
-            lr          = args.lr,
-            seed        = args.seed,
-        )
-        print(f"Stage {stage} done → {save_dir}")
+    kwargs = dict(
+        stage       = stage,
+        model_id    = args.model_id,
+        restore_dir = args.restore_dir,
+        lr          = args.lr,
+        seed        = args.seed,
+    )
+    _dispatch(train_stage, kwargs, args.detach, f"Stage {stage} training")
 
 
 def cmd_download(args):
