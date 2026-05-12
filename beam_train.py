@@ -106,7 +106,7 @@ gector_image = (
     ])
     .add_commands([
         # Install your fork of gector
-        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
+        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git@beam-version"
     ])
 )
 
@@ -117,7 +117,7 @@ gector_volume = Volume(name=VOLUME_NAME, mount_path=MOUNT)
 
 @function(
     image   = gector_image,
-    cpu     = 8,
+    cpu     = 4,
     memory  = "64Gi",   # stage1 has 8.8M sentences; 32 Gi OOM-killed at ~26%
     volumes = [gector_volume],
     timeout = 14400,    # 4 h — sharded processing of stage1 takes longer
