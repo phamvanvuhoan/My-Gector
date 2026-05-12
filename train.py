@@ -262,6 +262,7 @@ def main(args):
         pin_memory=True,      # <-- add, faster CPU→GPU transfer
         prefetch_factor=4,    # <-- prefetch 2 batches per worker
         persistent_workers=True,  # <-- keep workers alive between epochs
+        multiprocessing_context='spawn',   # <-- add this for mmap safety
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -270,6 +271,7 @@ def main(args):
         num_workers=16,
         pin_memory=True,
         persistent_workers=True,
+        multiprocessing_context='spawn',   # <-- add this for mmap safety
     )
     optimizer = torch.optim.Adam(
         model.parameters(),

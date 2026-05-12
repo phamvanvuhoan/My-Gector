@@ -79,7 +79,7 @@ STAGE_CFG = {
 @app.function(
     image   = image,
     cpu     = 8,           # more CPUs = faster tokenization
-    memory  = 32768,       # 32 GB — stage1 is 8.8M sentences
+    memory  = 49152,       # 48 GB — stage1 is 8.8M sentences
     volumes = {MOUNT: volume},
     timeout = 7200,        # 2 hours should be enough for all stages
 )

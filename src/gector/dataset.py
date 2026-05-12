@@ -4,6 +4,7 @@ import torch
 from tqdm import tqdm
 import os
 from transformers import PreTrainedTokenizer
+import numpy as np
 
 class GECToRDataset:
     def __init__(
@@ -51,75 +52,87 @@ class GECToRDataset:
         for i in range(len(self.labels)):
             self.labels[i]   = [label2id.get(l, label2id['<OOV>']) for l in self.labels[i]]
             self.d_labels[i] = [d_label2id[l] for l in self.d_labels[i]]
-        # convert to tensors immediately after vocab is applied
-        self._labels_to_tensors()
+        # convert to tensors after vocab applied
+        self.labels   = torch.tensor(self.labels,   dtype=torch.long)
+        self.d_labels = torch.tensor(self.d_labels, dtype=torch.long)
 
     def __len__(self):
         return len(self.srcs)
 
     def __getitem__(self, idx):
-        # ZERO tensor construction — pure tensor indexing only
-        if self.input_ids is not None:
-            return {
-                'input_ids':      self.input_ids[idx],
-                'attention_mask': self.attention_masks[idx],
-                'd_labels':       self.d_labels[idx],
-                'labels':         self.labels[idx],
-                'word_masks':     self.word_masks[idx],
-            }
-        # fallback if no cached input_ids (backward compat)
-        src    = self.srcs[idx]
-        encode = self.tokenizer(
-            src,
-            return_tensors='pt',
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            is_split_into_words=True
-        )
+        # input_ids and attention_mask — handle both mmap and tensor
+        if isinstance(self.input_ids, np.ndarray):
+            # mmap path
+            input_ids      = torch.from_numpy(np.array(self.input_ids[idx],      dtype='int32')).long()
+            attention_mask = torch.from_numpy(np.array(self.attention_masks[idx], dtype='int32')).long()
+            word_masks     = torch.from_numpy(np.array(self.word_masks[idx],      dtype='int32')).long()
+        else:
+            # tensor path (fallback)
+            input_ids      = self.input_ids[idx]
+            attention_mask = self.attention_masks[idx]
+            word_masks     = self.word_masks[idx]
+
+        # labels are always tensors after append_vocab()
         return {
-            'input_ids':      encode['input_ids'].squeeze(),
-            'attention_mask': encode['attention_mask'].squeeze(),
+            'input_ids':      input_ids,
+            'attention_mask': attention_mask,
             'd_labels':       self.d_labels[idx],
             'labels':         self.labels[idx],
-            'word_masks':     self.word_masks[idx],
+            'word_masks':     word_masks,
         }
 
 def align_labels_to_subwords(
     srcs: List[str],
-    word_labels: List[List[str]],
+    word_level_labels: List[List[str]],
     tokenizer: PreTrainedTokenizer,
-    batch_size: int=100000,
+    cache_file,
+    batch_size: int=50000,
     max_length: int=128,
     keep_label: str='$KEEP',
     pad_token: str='<PAD>',
     correct_label: str='$CORRECT',
     incorrect_label: str='$INCORRECT'
 ):
-    itr = list(range(0, len(srcs), batch_size))
-    subword_labels = []
+    n = len(srcs)
+    print(f"Total sentences: {n}")
+
+    # pre-allocate memory-mapped arrays on disk — never fully in RAM
+    input_ids_mm      = np.memmap(cache_file + '.input_ids.mmap',
+                                   dtype='int32', mode='w+', shape=(n, max_length))
+    attention_mask_mm = np.memmap(cache_file + '.attention_mask.mmap',
+                                   dtype='int32', mode='w+', shape=(n, max_length))
+    word_masks_mm     = np.memmap(cache_file + '.word_masks.mmap',
+                                   dtype='int32', mode='w+', shape=(n, max_length))
+    # labels stay as lists until vocab is applied, then converted later
+    subword_labels   = []
     subword_d_labels = []
-    word_masks = []
-    all_input_ids = []
-    all_attention_masks = []
+
+    itr = list(range(0, n, batch_size))
+    written = 0
+
     for i in tqdm(itr):
+        batch_srcs   = srcs[i:i+batch_size]
+        batch_labels = word_level_labels[i:i+batch_size]
+        batch_n      = len(batch_srcs)
+
         encode = tokenizer(
-            srcs[i:i+batch_size],
+            batch_srcs,
             max_length=max_length,
             return_tensors='pt',
             padding='max_length',
             truncation=True,
             is_split_into_words=True
         )
-        # store as tensors, not numpy
-        all_input_ids.append(encode['input_ids'])
-        all_attention_masks.append(encode['attention_mask'])
 
-        for i, wlabels in enumerate(word_labels[i:i+batch_size]):
+        # write directly to mmap — no accumulation in RAM
+        input_ids_mm[written:written+batch_n]      = encode['input_ids'].numpy()
+        attention_mask_mm[written:written+batch_n] = encode['attention_mask'].numpy()
+
+        for j, wlabels in enumerate(batch_labels):
             d_labels = []
-            labels = []
-            wmask = []
-            word_ids = encode.word_ids(i)
+            labels   = []
+            wmask    = []
+            word_ids = encode.word_ids(j)
             previous_word_idx = None
             for word_idx in word_ids:
                 if word_idx is None:
@@ -130,24 +143,36 @@ def align_labels_to_subwords(
                     l = wlabels[word_idx]
                     labels.append(l)
                     wmask.append(1)
-                    if l != keep_label:
-                        d_labels.append(incorrect_label)
-                    else:
-                        d_labels.append(correct_label)
+                    d_labels.append(
+                        incorrect_label if l != keep_label else correct_label
+                    )
                 else:
                     labels.append(pad_token)
                     d_labels.append(pad_token)
                     wmask.append(0)
                 previous_word_idx = word_idx
-            subword_d_labels.append(d_labels)
             subword_labels.append(labels)
-            word_masks.append(wmask)
-    
-    # cat all batches into single tensors
-    input_ids_tensor      = torch.cat(all_input_ids,      dim=0)
-    attention_masks_tensor = torch.cat(all_attention_masks, dim=0)
+            subword_d_labels.append(d_labels)
+            wmask_arr = np.array(wmask, dtype='int32')
+            # pad or truncate wmask to max_length
+            if len(wmask_arr) < max_length:
+                wmask_arr = np.pad(wmask_arr, (0, max_length - len(wmask_arr)))
+            word_masks_mm[written+j] = wmask_arr[:max_length]
 
-    return subword_d_labels, subword_labels, word_masks, input_ids_tensor, attention_masks_tensor
+        written += batch_n
+
+        # flush periodically to avoid OS page cache buildup
+        if (i // batch_size) % 10 == 0:
+            input_ids_mm.flush()
+            attention_mask_mm.flush()
+            word_masks_mm.flush()
+
+    input_ids_mm.flush()
+    attention_mask_mm.flush()
+    word_masks_mm.flush()
+
+    return subword_d_labels, subword_labels, \
+           input_ids_mm, attention_mask_mm, word_masks_mm
 
 def load_gector_format(
     input_file: str,
@@ -187,53 +212,63 @@ def load_dataset(
     use_cache: bool = True,        # <-- add
 ):
     cache_file = _cache_path(input_file, tokenizer, max_length)
+    meta_file  = cache_file + '.meta.pt'
 
-    if use_cache and os.path.exists(cache_file):
-        print(f"Loading cached dataset from {cache_file} ...")
-        data = torch.load(cache_file)
+    if use_cache and os.path.exists(meta_file):
+        print(f"✓ Cache hit: {cache_file}")
+        meta = torch.load(meta_file)
+        n    = meta['n']
+
+        # load as mmap — only pages actually accessed are read from disk
+        input_ids_mm      = np.memmap(cache_file + '.input_ids.mmap',
+                                       dtype='int32', mode='r', shape=(n, max_length))
+        attention_mask_mm = np.memmap(cache_file + '.attention_mask.mmap',
+                                       dtype='int32', mode='r', shape=(n, max_length))
+        word_masks_mm     = np.memmap(cache_file + '.word_masks.mmap',
+                                       dtype='int32', mode='r', shape=(n, max_length))
         return GECToRDataset(
-            srcs            = data['srcs'],
-            d_labels        = data['d_labels'],
-            labels          = data['labels'],
-            word_masks      = data['word_masks'],
-            input_ids       = data['input_ids'],
-            attention_masks = data['attention_masks'],
+            srcs            = meta['srcs'],
+            d_labels        = meta['d_labels'],
+            labels          = meta['labels'],
+            word_masks      = word_masks_mm,
+            input_ids       = input_ids_mm,
+            attention_masks = attention_mask_mm,
             tokenizer       = tokenizer,
             max_length      = max_length,
         )
 
-    # cache miss — do the full preprocessing
     srcs, word_level_labels = load_gector_format(
         input_file,
         delimeter=delimeter,
         additional_delimeter=additional_delimeter
     )
-    d_labels, labels, word_masks, input_ids, attention_masks = align_labels_to_subwords(
-        srcs,
-        word_level_labels,
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        max_length=max_length
-    )
+
+    d_labels, labels, input_ids_mm, attention_mask_mm, word_masks_mm = \
+        align_labels_to_subwords(
+            srcs,
+            word_level_labels,
+            tokenizer=tokenizer,
+            cache_file=cache_file,
+            batch_size=batch_size,
+            max_length=max_length
+        )
 
     if use_cache:
-        print(f"Saving cache to {cache_file} ...")
-        torch.save({               # torch.save handles tensors better than pickle
-            'srcs':            srcs,
-            'd_labels':        d_labels,
-            'labels':          labels,
-            'word_masks':      word_masks,
-            'input_ids':       input_ids,        # already a tensor
-            'attention_masks': attention_masks,   # already a tensor
-        }, cache_file)
+        print(f"Saving cache metadata to {meta_file} ...")
+        torch.save({
+            'n':        len(srcs),
+            'srcs':     srcs,
+            'd_labels': d_labels,   # still lists, vocab not applied yet
+            'labels':   labels,
+        }, meta_file)
 
     return GECToRDataset(
         srcs            = srcs,
         d_labels        = d_labels,
         labels          = labels,
-        word_masks      = word_masks,
-        input_ids       = input_ids,
-        attention_masks = attention_masks,
+        word_masks      = word_masks_mm,
+        input_ids       = input_ids_mm,
+        attention_masks = attention_mask_mm,
         tokenizer       = tokenizer,
         max_length      = max_length,
     )
