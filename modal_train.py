@@ -24,6 +24,7 @@ MOUNT  = "/gector-data"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .env({"FORCE_REBUILD": "2024-05-12"})
     .apt_install("git")
     .pip_install(
         "torch>=2.6.0",
@@ -34,6 +35,7 @@ image = (
         "wandb",
     )
     .run_commands(
+        #hope this help me rebuild image v1
         "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
     )
     .add_local_file("train.py", "/root/train.py")   # <-- add this
@@ -142,6 +144,129 @@ def preprocess_all(
         print(f"✓ {name} cached and committed to volume")
 
     print("\n✓ All preprocessing done. Ready to train.")
+
+# Verify cache integrity before training — run this to check for any issues with the cached files that could cause training to fail. This is especially useful if you had an interruption during preprocessing or if you want to sanity-check the cache before launching a long training run.
+@app.function(
+    image   = image,
+    cpu     = 4,
+    memory  = 16384,
+    volumes = {MOUNT: volume},
+    timeout = 600,
+)
+def verify_cache():
+    import numpy as np
+    import torch
+    import os
+    from pathlib import Path
+
+    cache_dir = f"{MOUNT}/cache"
+    issues    = []
+
+    cache_files = list(Path(cache_dir).glob("*.meta.pt"))
+    if not cache_files:
+        print("No cache files found!")
+        return
+
+    for meta_file in sorted(cache_files):
+        base = str(meta_file).replace('.meta.pt', '')
+        name = meta_file.name.replace('.meta.pt', '')
+        print(f"\nChecking {name} ...")
+
+        # 1. check all expected files exist
+        expected = [
+            meta_file,
+            base + '.input_ids.mmap',
+            base + '.attention_mask.mmap',
+            base + '.word_masks.mmap',
+        ]
+        for f in expected:
+            if not os.path.exists(f):
+                issues.append(f"MISSING FILE: {f}")
+                print(f"  ✗ Missing: {f}")
+            else:
+                size_gb = os.path.getsize(f) / 1e9
+                print(f"  ✓ Exists:  {f} ({size_gb:.2f} GB)")
+
+        # 2. load meta and check contents
+        try:
+            meta = torch.load(str(meta_file))
+            n         = meta['n']
+            n_labels  = len(meta['labels'])
+            n_dlabels = len(meta['d_labels'])
+            n_srcs    = len(meta['srcs'])
+            print(f"  n={n}, srcs={n_srcs}, labels={n_labels}, d_labels={n_dlabels}")
+
+            if not (n == n_labels == n_dlabels == n_srcs):
+                issues.append(
+                    f"SIZE MISMATCH in {name}: "
+                    f"n={n} srcs={n_srcs} labels={n_labels} d_labels={n_dlabels}"
+                )
+                print(f"  ✗ Size mismatch!")
+            else:
+                print(f"  ✓ Meta sizes consistent")
+        except Exception as e:
+            issues.append(f"META LOAD ERROR in {name}: {e}")
+            print(f"  ✗ Failed to load meta: {e}")
+            continue
+
+        # 3. check mmap shapes and spot-check values
+        try:
+            input_ids_mm = np.memmap(
+                base + '.input_ids.mmap',
+                dtype='int32', mode='r', shape=(n, 80)
+            )
+            attn_mm = np.memmap(
+                base + '.attention_mask.mmap',
+                dtype='int32', mode='r', shape=(n, 80)
+            )
+            wm_mm = np.memmap(
+                base + '.word_masks.mmap',
+                dtype='int32', mode='r', shape=(n, 80)
+            )
+
+            # check first, middle, last rows are not all zeros
+            for row_name, idx in [('first', 0), ('middle', n//2), ('last', n-1)]:
+                ids_row  = input_ids_mm[idx]
+                attn_row = attn_mm[idx]
+                if ids_row.sum() == 0:
+                    issues.append(f"ALL ZERO input_ids at row {idx} ({row_name}) in {name}")
+                    print(f"  ✗ All-zero input_ids at {row_name} row ({idx})")
+                elif attn_row.sum() == 0:
+                    issues.append(f"ALL ZERO attention_mask at row {idx} ({row_name}) in {name}")
+                    print(f"  ✗ All-zero attention_mask at {row_name} row ({idx})")
+                else:
+                    print(f"  ✓ {row_name} row looks valid (input_ids sum={ids_row.sum()})")
+
+            # check last batch specifically — most likely to be corrupted
+            print(f"  Checking last 1000 rows ...")
+            last_chunk = input_ids_mm[n-1000:n]
+            zero_rows  = (last_chunk.sum(axis=1) == 0).sum()
+            if zero_rows > 0:
+                issues.append(
+                    f"CORRUPT TAIL: {zero_rows} all-zero rows in last 1000 of {name}"
+                )
+                print(f"  ✗ {zero_rows} zero rows in last 1000 — likely corrupt from heartbeat failure")
+            else:
+                print(f"  ✓ Last 1000 rows look valid")
+
+        except Exception as e:
+            issues.append(f"MMAP ERROR in {name}: {e}")
+            print(f"  ✗ mmap failed: {e}")
+
+    # summary
+    print(f"\n{'='*50}")
+    if issues:
+        print(f"FOUND {len(issues)} ISSUE(S):")
+        for issue in issues:
+            print(f"  ✗ {issue}")
+        print("\nRecommendation: clear cache and rerun preprocess for affected files")
+    else:
+        print("✓ All cache files look valid. Safe to train.")
+
+
+@app.local_entrypoint()
+def verify():
+    verify_cache.remote()
 
 # ── Core training function (runs on Modal GPU) ─────────────────────────────────
 MAX_RETRIES = 10   # Modal preempts at most this many times before we give up
@@ -254,12 +379,12 @@ def preprocess(
     model_id: str = "roberta-base",
     max_len:  int = 80,
 ):
-    preprocess_all.remote(model_id=model_id, max_len=max_len)
+    preprocess_all.spawn(model_id=model_id, max_len=max_len)
 
 @app.local_entrypoint()
 def clear_cache():
     import subprocess
-    clear.remote()
+    clear.spawn()
 
 @app.function(image=image, volumes={MOUNT: volume})
 def clear():
@@ -288,7 +413,7 @@ def run_stage1(
 ):
     """Train stage 1 (large synthetic corpus, cold-start classifier)."""
     _maybe_override_batch(1, batch_size)
-    save_dir = train_stage.remote(
+    save_dir = train_stage.spawn(
         stage    = 1,
         model_id = model_id,
         lr       = lr,
@@ -306,7 +431,7 @@ def run_stage2(
 ):
     """Train stage 2 (BEA19 corpus, resume from stage 1)."""
     _maybe_override_batch(2, batch_size)
-    save_dir = train_stage.remote(
+    save_dir = train_stage.spawn(
         stage       = 2,
         restore_dir = restore_dir,
         lr          = lr,
@@ -324,7 +449,7 @@ def run_stage3(
 ):
     """Train stage 3 (W&I+LOCNESS fine-tune, no cold epochs)."""
     _maybe_override_batch(3, batch_size)
-    save_dir = train_stage.remote(
+    save_dir = train_stage.spawn(
         stage       = 3,
         restore_dir = restore_dir,
         lr          = lr,
