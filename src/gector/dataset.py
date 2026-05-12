@@ -195,12 +195,20 @@ def load_gector_format(
 import pickle
 import hashlib
 
+CACHE_DIR = "/gector-data/cache"
+
 def _cache_path(input_file: str, tokenizer, max_length: int) -> str:
-    """Generate a unique cache filename based on file + tokenizer + config."""
-    # hash the tokenizer name and max_length so changing them invalidates cache
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
     key = f"{input_file}_{tokenizer.name_or_path}_{max_length}"
     h = hashlib.md5(key.encode()).hexdigest()[:8]
-    return input_file + f".cache_{h}.pkl"
+
+    filename = os.path.basename(input_file)
+
+    return os.path.join(
+        CACHE_DIR,
+        f"{filename}.cache_{h}"
+    )
 
 def load_dataset(
     input_file: str,

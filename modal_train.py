@@ -263,11 +263,19 @@ def clear_cache():
 
 @app.function(image=image, volumes={MOUNT: volume})
 def clear():
-    import glob, os
-    files = glob.glob(f"{MOUNT}/cache/*")
-    for f in files:
-        os.remove(f)
-        print(f"Deleted {f}")
+    import os
+
+    for root, dirs, files in os.walk(MOUNT):
+        for file in files:
+            if "cache" in file.lower():
+                path = os.path.join(root, file)
+
+                try:
+                    os.remove(path)
+                    print(f"Deleted {path}")
+                except Exception as e:
+                    print(f"Failed to delete {path}: {e}")
+
     volume.commit()
     print("✓ Cache cleared")
 
