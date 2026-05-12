@@ -47,7 +47,7 @@ import os
 import sys
 from pathlib import Path
 
-from beam import Image, Volume, function
+from beam import Image, Volume, endpoint
 
 # ── Shared volume / paths ──────────────────────────────────────────────────────
 
@@ -60,7 +60,6 @@ DATA        = MOUNT
 VOCAB_DIR   = f"{MOUNT}/output_vocabulary"
 SAVE_BASE   = f"{MOUNT}/checkpoints"
 HF_CACHE    = f"{MOUNT}/hf_cache"
-CACHE_DIR   = f"{MOUNT}/cache"
 
 # ── Per-stage hyperparameters ──────────────────────────────────────────────────
 
@@ -103,6 +102,7 @@ gector_image = (
         "huggingface-hub>=0.28.1",
         "python-levenshtein>=0.26.1",
         "wandb",
+        "psutil",   # for RAM logging in preprocess_all
     ])
     .add_commands([
         # Install your fork of gector
@@ -110,31 +110,43 @@ gector_image = (
     ])
 )
 
-# Beam Volume object — attached to every function below
+# Beam Volume object — attached to every endpoint below
 gector_volume = Volume(name=VOLUME_NAME, mount_path=MOUNT)
 
 # ── Preprocessing (CPU-only) ───────────────────────────────────────────────────
 
-@function(
+@endpoint(
     image   = gector_image,
     cpu     = 8,
-    memory  = "32Gi",
+    memory  = "64Gi",   # stage1 has 8.8M sentences; 32 Gi OOM-killed at ~26%
     volumes = [gector_volume],
-    timeout = 7200,
+    timeout = 14400,    # 4 h — sharded processing of stage1 takes longer
+    secrets = ["WANDB_API_KEY"],
 )
-def preprocess_all(model_id: str = "roberta-base", max_len: int = 80):
+def preprocess_all(
+    model_id:   str = "roberta-base",
+    max_len:    int = 80,
+    shard_size: int = 500_000,   # sentences per shard; lower to 200k if still OOM
+):
     """
-    Tokenise and cache all stage datasets on CPU.
-    Run once before any training stage.
+    Tokenise and cache all stage datasets on CPU using sharded saves.
+
+    Instead of holding all 8.8M tokenised tensors in RAM before writing,
+    we process `shard_size` sentences at a time and flush each shard to
+    the volume immediately.  Peak RAM is bounded to ~1 shard at a time.
+    A mid-run crash is safe — already-saved shards are skipped on retry.
     """
     import os
+    import psutil
     from transformers import AutoTokenizer
     from gector import load_dataset
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    os.makedirs(HF_CACHE,  exist_ok=True)
-    os.environ["HF_HOME"]          = HF_CACHE
-    os.environ["GECTOR_CACHE_DIR"] = CACHE_DIR
+    def log_mem(tag: str):
+        mb = psutil.Process().memory_info().rss / 1e6
+        print(f"  [RAM] {tag}: {mb:.0f} MB")
+
+    os.makedirs(HF_CACHE, exist_ok=True)
+    os.environ["HF_HOME"] = HF_CACHE
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, add_prefix_space=True
@@ -155,20 +167,23 @@ def preprocess_all(model_id: str = "roberta-base", max_len: int = 80):
             print(f"SKIP {name}: not found at {file_path}")
             continue
         print(f"\n{'='*50}\nProcessing {name} …\n{'='*50}")
+        log_mem("before")
         load_dataset(
             input_file = file_path,
             tokenizer  = tokenizer,
             max_length = max_len,
             use_cache  = True,
+            shard_size = shard_size,
         )
+        log_mem("after")
         print(f"✓ {name} cached")
 
     print("\n✓ All preprocessing done.")
 
 
-# ── Core training function (RTX 4090) ─────────────────────────────────────────
+# ── Core training endpoint (RTX 4090) ─────────────────────────────────────────
 
-@function(
+@endpoint(
     image   = gector_image,
     gpu     = "RTX4090",
     cpu     = 8,

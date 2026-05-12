@@ -17,32 +17,28 @@ class GECToRDataset:
         input_ids=None,
         attention_masks=None,
     ):
-        self.tokenizer     = tokenizer
-        self.srcs          = srcs
-        self.max_length    = max_length
-        self.label2id      = None
-        self.d_label2id    = None
+        self.tokenizer      = tokenizer
+        self.srcs           = srcs
+        self.max_length     = max_length
+        self.label2id       = None
+        self.d_label2id     = None
 
-        # convert everything to tensors ONCE here, not in __getitem__
         if input_ids is not None:
-            self.input_ids      = input_ids if isinstance(input_ids, torch.Tensor) \
-                                  else torch.tensor(input_ids,      dtype=torch.long)
+            self.input_ids       = input_ids if isinstance(input_ids, torch.Tensor) \
+                                   else torch.tensor(input_ids, dtype=torch.long)
             self.attention_masks = attention_masks if isinstance(attention_masks, torch.Tensor) \
-                                  else torch.tensor(attention_masks, dtype=torch.long)
+                                   else torch.tensor(attention_masks, dtype=torch.long)
         else:
             self.input_ids       = None
             self.attention_masks = None
 
-        # labels stay as lists until append_vocab() converts them,
-        # so we defer tensor conversion to after append_vocab()
-        self.d_labels  = d_labels
-        self.labels    = labels
+        self.d_labels   = d_labels
+        self.labels     = labels
         self.word_masks = word_masks
 
     def _labels_to_tensors(self):
-        """Call once after append_vocab() to lock everything into tensors."""
-        self.labels    = torch.tensor(self.labels,    dtype=torch.long)
-        self.d_labels  = torch.tensor(self.d_labels,  dtype=torch.long)
+        self.labels     = torch.tensor(self.labels,     dtype=torch.long)
+        self.d_labels   = torch.tensor(self.d_labels,   dtype=torch.long)
         self.word_masks = torch.tensor(self.word_masks, dtype=torch.long)
 
     def append_vocab(self, label2id, d_label2id):
@@ -51,14 +47,12 @@ class GECToRDataset:
         for i in range(len(self.labels)):
             self.labels[i]   = [label2id.get(l, label2id['<OOV>']) for l in self.labels[i]]
             self.d_labels[i] = [d_label2id[l] for l in self.d_labels[i]]
-        # convert to tensors immediately after vocab is applied
         self._labels_to_tensors()
 
     def __len__(self):
         return len(self.srcs)
 
     def __getitem__(self, idx):
-        # ZERO tensor construction — pure tensor indexing only
         if self.input_ids is not None:
             return {
                 'input_ids':      self.input_ids[idx],
@@ -67,7 +61,6 @@ class GECToRDataset:
                 'labels':         self.labels[idx],
                 'word_masks':     self.word_masks[idx],
             }
-        # fallback if no cached input_ids (backward compat)
         src    = self.srcs[idx]
         encode = self.tokenizer(
             src,
@@ -85,41 +78,42 @@ class GECToRDataset:
             'word_masks':     self.word_masks[idx],
         }
 
+
 def align_labels_to_subwords(
     srcs: List[str],
     word_labels: List[List[str]],
     tokenizer: PreTrainedTokenizer,
-    batch_size: int=100000,
-    max_length: int=128,
-    keep_label: str='$KEEP',
-    pad_token: str='<PAD>',
-    correct_label: str='$CORRECT',
-    incorrect_label: str='$INCORRECT'
+    batch_size: int = 100000,
+    max_length: int = 128,
+    keep_label: str = '$KEEP',
+    pad_token: str = '<PAD>',
+    correct_label: str = '$CORRECT',
+    incorrect_label: str = '$INCORRECT'
 ):
     itr = list(range(0, len(srcs), batch_size))
-    subword_labels = []
+    subword_labels   = []
     subword_d_labels = []
-    word_masks = []
-    all_input_ids = []
+    word_masks       = []
+    all_input_ids    = []
     all_attention_masks = []
+
     for i in tqdm(itr):
         encode = tokenizer(
-            srcs[i:i+batch_size],
+            srcs[i:i + batch_size],
             max_length=max_length,
             return_tensors='pt',
             padding='max_length',
             truncation=True,
             is_split_into_words=True
         )
-        # store as tensors, not numpy
         all_input_ids.append(encode['input_ids'])
         all_attention_masks.append(encode['attention_mask'])
 
-        for i, wlabels in enumerate(word_labels[i:i+batch_size]):
+        for j, wlabels in enumerate(word_labels[i:i + batch_size]):
             d_labels = []
-            labels = []
-            wmask = []
-            word_ids = encode.word_ids(i)
+            labels   = []
+            wmask    = []
+            word_ids = encode.word_ids(j)
             previous_word_idx = None
             for word_idx in word_ids:
                 if word_idx is None:
@@ -130,10 +124,7 @@ def align_labels_to_subwords(
                     l = wlabels[word_idx]
                     labels.append(l)
                     wmask.append(1)
-                    if l != keep_label:
-                        d_labels.append(incorrect_label)
-                    else:
-                        d_labels.append(correct_label)
+                    d_labels.append(incorrect_label if l != keep_label else correct_label)
                 else:
                     labels.append(pad_token)
                     d_labels.append(pad_token)
@@ -142,40 +133,106 @@ def align_labels_to_subwords(
             subword_d_labels.append(d_labels)
             subword_labels.append(labels)
             word_masks.append(wmask)
-    
-    # cat all batches into single tensors
-    input_ids_tensor      = torch.cat(all_input_ids,      dim=0)
+
+    input_ids_tensor       = torch.cat(all_input_ids,       dim=0)
     attention_masks_tensor = torch.cat(all_attention_masks, dim=0)
 
     return subword_d_labels, subword_labels, word_masks, input_ids_tensor, attention_masks_tensor
 
+
 def load_gector_format(
     input_file: str,
-    delimeter: str='SEPL|||SEPR',
-    additional_delimeter: str='SEPL__SEPR'
-):  
-    srcs = []
-    word_level_labels = []  # the size will be (#sents, seq_length) if not get_interactive_tags,
-                                # (#iteration, #sents, seq_length) if get_interactive_tags
+    delimeter: str = 'SEPL|||SEPR',
+    additional_delimeter: str = 'SEPL__SEPR'
+):
+    srcs             = []
+    word_level_labels = []
     with open(input_file) as f:
         for line in f:
-            src = [x.split(delimeter)[0] for x in line.split()]
+            src    = [x.split(delimeter)[0] for x in line.split()]
             labels = [x.split(delimeter)[1] for x in line.split()]
-            # Use only first tags. E.g. $REPLACE_meSEPL__SEPR$APPEND_too → $REPLACE_me
             labels = [l.split(additional_delimeter)[0] for l in labels]
             srcs.append(src)
             word_level_labels.append(labels)
     return srcs, word_level_labels
-    
-import pickle
+
+
 import hashlib
 
-def _cache_path(input_file: str, tokenizer, max_length: int) -> str:
-    """Generate a unique cache filename based on file + tokenizer + config."""
-    # hash the tokenizer name and max_length so changing them invalidates cache
+# ── Sharded cache helpers ──────────────────────────────────────────────────────
+#
+# Stage 1 has ~8.8 M sentences. Holding all tokenised tensors in RAM at once
+# before torch.save causes a silent OOM kill at around 26% progress.
+# The fix: process SHARD_SIZE sentences at a time, save each shard immediately,
+# then mmap-load them back as a ConcatDataset — peak RAM stays bounded.
+
+SHARD_SIZE = 500_000   # sentences per shard; tune down to 200k if still OOM
+
+
+def _cache_key(input_file: str, tokenizer, max_length: int) -> str:
     key = f"{input_file}_{tokenizer.name_or_path}_{max_length}"
-    h = hashlib.md5(key.encode()).hexdigest()[:8]
-    return input_file + f".cache_{h}.pkl"
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def _shard_path(input_file: str, cache_key: str, shard_idx: int) -> str:
+    return f"{input_file}.cache_{cache_key}_shard{shard_idx:04d}.pt"
+
+
+def _manifest_path(input_file: str, cache_key: str) -> str:
+    return f"{input_file}.cache_{cache_key}_manifest.pt"
+
+
+def _save_shard(
+    path: str,
+    srcs,
+    d_labels,
+    labels,
+    word_masks,
+    input_ids: torch.Tensor,
+    attention_masks: torch.Tensor,
+):
+    torch.save({
+        'srcs':            srcs,
+        'd_labels':        d_labels,
+        'labels':          labels,
+        'word_masks':      word_masks,
+        'input_ids':       input_ids,
+        'attention_masks': attention_masks,
+    }, path)
+
+
+def _load_shards(manifest: dict, tokenizer, max_length: int) -> 'GECToRDataset':
+    """Load all shards and concatenate into one GECToRDataset."""
+    all_srcs            = []
+    all_d_labels        = []
+    all_labels          = []
+    all_word_masks      = []
+    all_input_ids       = []
+    all_attention_masks = []
+
+    for shard_path in manifest['shard_paths']:
+        print(f"  Loading shard {shard_path} …")
+        data = torch.load(shard_path, weights_only=False)
+        all_srcs.extend(data['srcs'])
+        all_d_labels.extend(data['d_labels'])
+        all_labels.extend(data['labels'])
+        all_word_masks.extend(data['word_masks'])
+        all_input_ids.append(data['input_ids'])
+        all_attention_masks.append(data['attention_masks'])
+
+    return GECToRDataset(
+        srcs            = all_srcs,
+        d_labels        = all_d_labels,
+        labels          = all_labels,
+        word_masks      = all_word_masks,
+        input_ids       = torch.cat(all_input_ids,       dim=0),
+        attention_masks = torch.cat(all_attention_masks, dim=0),
+        tokenizer       = tokenizer,
+        max_length      = max_length,
+    )
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def load_dataset(
     input_file: str,
@@ -184,56 +241,85 @@ def load_dataset(
     additional_delimeter: str = 'SEPL__SEPR',
     batch_size: int = 50000,
     max_length: int = 128,
-    use_cache: bool = True,        # <-- add
-):
-    cache_file = _cache_path(input_file, tokenizer, max_length)
+    use_cache: bool = True,
+    shard_size: int = SHARD_SIZE,
+) -> GECToRDataset:
+    """
+    Load a GECToR-format dataset with sharded caching.
 
-    if use_cache and os.path.exists(cache_file):
-        print(f"Loading cached dataset from {cache_file} ...")
-        data = torch.load(cache_file)
-        return GECToRDataset(
-            srcs            = data['srcs'],
-            d_labels        = data['d_labels'],
-            labels          = data['labels'],
-            word_masks      = data['word_masks'],
-            input_ids       = data['input_ids'],
-            attention_masks = data['attention_masks'],
-            tokenizer       = tokenizer,
-            max_length      = max_length,
-        )
+    Each shard of `shard_size` sentences is tokenised and saved independently,
+    so peak RAM never exceeds one shard worth of tensors at a time.
+    This prevents the silent OOM kill that occurred at ~26% of stage1.
+    """
+    cache_key      = _cache_key(input_file, tokenizer, max_length)
+    manifest_file  = _manifest_path(input_file, cache_key)
 
-    # cache miss — do the full preprocessing
-    srcs, word_level_labels = load_gector_format(
+    # ── Cache hit: all shards already exist ───────────────────────────────────
+    if use_cache and os.path.exists(manifest_file):
+        print(f"Loading sharded cache from manifest {manifest_file} …")
+        manifest = torch.load(manifest_file, weights_only=False)
+        # Verify every shard still exists (partial runs leave gaps)
+        missing = [p for p in manifest['shard_paths'] if not os.path.exists(p)]
+        if not missing:
+            return _load_shards(manifest, tokenizer, max_length)
+        print(f"  {len(missing)} shard(s) missing — rebuilding from scratch.")
+
+    # ── Cache miss: parse the raw file ────────────────────────────────────────
+    print(f"Parsing {input_file} …")
+    all_srcs, all_word_labels = load_gector_format(
         input_file,
         delimeter=delimeter,
         additional_delimeter=additional_delimeter
     )
-    d_labels, labels, word_masks, input_ids, attention_masks = align_labels_to_subwords(
-        srcs,
-        word_level_labels,
-        tokenizer=tokenizer,
-        batch_size=batch_size,
-        max_length=max_length
-    )
+    n_total = len(all_srcs)
+    print(f"  {n_total:,} sentences loaded.")
 
+    shard_paths = []
+    n_shards    = (n_total + shard_size - 1) // shard_size
+
+    for shard_idx in range(n_shards):
+        shard_file = _shard_path(input_file, cache_key, shard_idx)
+
+        # Skip already-saved shards so a mid-run crash is resumable
+        if use_cache and os.path.exists(shard_file):
+            print(f"  Shard {shard_idx+1}/{n_shards} already cached — skipping.")
+            shard_paths.append(shard_file)
+            continue
+
+        lo = shard_idx * shard_size
+        hi = min(lo + shard_size, n_total)
+        print(f"\n  Shard {shard_idx+1}/{n_shards}: sentences {lo:,}–{hi:,}")
+
+        srcs_chunk   = all_srcs[lo:hi]
+        labels_chunk = all_word_labels[lo:hi]
+
+        d_labels, labels, word_masks, input_ids, attention_masks = \
+            align_labels_to_subwords(
+                srcs_chunk,
+                labels_chunk,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+                max_length=max_length,
+            )
+
+        if use_cache:
+            print(f"  Saving shard → {shard_file}")
+            _save_shard(
+                shard_file,
+                srcs_chunk, d_labels, labels, word_masks,
+                input_ids, attention_masks
+            )
+            # Free tensors immediately after saving
+            del d_labels, labels, word_masks, input_ids, attention_masks
+            import gc; gc.collect()
+
+        shard_paths.append(shard_file)
+
+    # Write manifest so future runs skip everything
     if use_cache:
-        print(f"Saving cache to {cache_file} ...")
-        torch.save({               # torch.save handles tensors better than pickle
-            'srcs':            srcs,
-            'd_labels':        d_labels,
-            'labels':          labels,
-            'word_masks':      word_masks,
-            'input_ids':       input_ids,        # already a tensor
-            'attention_masks': attention_masks,   # already a tensor
-        }, cache_file)
+        torch.save({'shard_paths': shard_paths}, manifest_file)
+        print(f"\n✓ All {n_shards} shards cached. Manifest → {manifest_file}")
 
-    return GECToRDataset(
-        srcs            = srcs,
-        d_labels        = d_labels,
-        labels          = labels,
-        word_masks      = word_masks,
-        input_ids       = input_ids,
-        attention_masks = attention_masks,
-        tokenizer       = tokenizer,
-        max_length      = max_length,
-    )
+    print("Loading all shards into memory …")
+    manifest = {'shard_paths': shard_paths}
+    return _load_shards(manifest, tokenizer, max_length)
