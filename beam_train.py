@@ -102,12 +102,15 @@ gector_image = (
         "huggingface-hub>=0.28.1",
         "python-levenshtein>=0.26.1",
         "wandb",
-        "psutil",   # for RAM logging in preprocess_all
+        "psutil",
     ])
     .add_commands([
-        # Install your fork of gector
-        "pip install --no-cache-dir --force-reinstall git+https://github.com/phamvanvuhoan/My-Gector.git@beam-version"
+        "pip install --no-cache-dir --force-reinstall git+https://github.com/phamvanvuhoan/My-Gector.git@beam-version",
     ])
+    # train.py is uploaded from your local machine by Beam automatically
+    # via the code mount (/mnt/code) — no .add_local_file() needed unlike Modal.
+    # Beam mounts the entire directory you run beam_train.py from into /mnt/code,
+    # so train.py just needs to sit next to beam_train.py locally.
 )
 
 # Beam Volume object — attached to every function below
@@ -268,7 +271,12 @@ def train_stage(
     print(f"\n=== Stage {stage} command ===")
     print(" ".join(cmd))
 
-    subprocess.run(cmd, check=True, env=os.environ.copy())
+    result = subprocess.run(cmd, env=os.environ.copy())
+    if result.returncode != 0:
+        # Re-run with stderr captured so the actual error appears in beam logs
+        print(f"\ntrain.py exited with code {result.returncode}. "
+              "Check the output above for the real error.")
+        raise RuntimeError(f"train.py failed with exit code {result.returncode}")
 
     print(f"\n✓ Stage {stage} complete. Checkpoints saved to {save_dir}")
     return save_dir

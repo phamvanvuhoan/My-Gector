@@ -1,10 +1,3 @@
-# At top of train.py
-try:
-    import modal
-    volume = modal.Volume.from_name("gector-data")
-except ImportError:
-    volume = None   # running locally, no-op
-
 import argparse
 from transformers import AutoTokenizer, get_scheduler
 from gector import (
@@ -351,7 +344,6 @@ def main(args):
             global_step=global_step,                            # <-- add
             ckpt_steps=args.ckpt_steps,       # <-- add
             save_dir=args.save_dir,                             # <-- add
-            volume=volume,                                      # <-- add
             ckpt_limit=args.ckpt_limit, # <-- add
             resume_step=resume_step if e == resume_epoch else 0,  # <-- add
         )
