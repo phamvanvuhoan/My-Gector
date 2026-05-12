@@ -201,35 +201,118 @@ def _save_shard(
     }, path)
 
 
-def _load_shards(manifest: dict, tokenizer, max_length: int) -> 'GECToRDataset':
-    """Load all shards and concatenate into one GECToRDataset."""
-    all_srcs            = []
-    all_d_labels        = []
-    all_labels          = []
-    all_word_masks      = []
-    all_input_ids       = []
-    all_attention_masks = []
+class ShardedGECToRDataset(torch.utils.data.Dataset):
+    """
+    A dataset that reads shards lazily — only one shard lives in RAM at a time.
 
-    for shard_path in manifest['shard_paths']:
-        print(f"  Loading shard {shard_path} …")
-        data = torch.load(shard_path, weights_only=False)
-        all_srcs.extend(data['srcs'])
-        all_d_labels.extend(data['d_labels'])
-        all_labels.extend(data['labels'])
-        all_word_masks.extend(data['word_masks'])
-        all_input_ids.append(data['input_ids'])
-        all_attention_masks.append(data['attention_masks'])
+    This avoids the second OOM that occurred when _load_shards tried to
+    torch.cat all 18 × ~3 Gi shards simultaneously.
 
-    return GECToRDataset(
-        srcs            = all_srcs,
-        d_labels        = all_d_labels,
-        labels          = all_labels,
-        word_masks      = all_word_masks,
-        input_ids       = torch.cat(all_input_ids,       dim=0),
-        attention_masks = torch.cat(all_attention_masks, dim=0),
-        tokenizer       = tokenizer,
-        max_length      = max_length,
-    )
+    Layout per shard file (as saved by _save_shard):
+        {srcs, d_labels, labels, word_masks, input_ids, attention_masks}
+
+    After append_vocab() is called, label strings are converted to ids and
+    stored back into each shard file so subsequent epochs skip re-conversion.
+    """
+
+    def __init__(self, shard_paths: list, tokenizer, max_length: int):
+        self.shard_paths  = shard_paths
+        self.tokenizer    = tokenizer
+        self.max_length   = max_length
+        self.label2id     = None
+        self.d_label2id   = None
+
+        # Build a cumulative index so __getitem__ can map global idx → shard
+        self._shard_sizes  = []
+        self._cum_sizes    = []   # cumulative, len = n_shards + 1
+        cum = 0
+        self._cum_sizes.append(0)
+        for p in shard_paths:
+            # Peek at just the srcs list to get length without loading tensors
+            data = torch.load(p, weights_only=False)
+            n = len(data['srcs'])
+            self._shard_sizes.append(n)
+            cum += n
+            self._cum_sizes.append(cum)
+
+        # Cache for the currently loaded shard
+        self._cached_shard_idx  = -1
+        self._cached_shard_data = None
+
+    # ── vocab ──────────────────────────────────────────────────────────────────
+
+    def append_vocab(self, label2id: dict, d_label2id: dict):
+        """
+        Convert string labels → integer ids in every shard and re-save.
+        Called once from train.py before the DataLoader is created.
+        """
+        self.label2id   = label2id
+        self.d_label2id = d_label2id
+
+        for shard_path in self.shard_paths:
+            print(f"  [vocab] converting {shard_path} …")
+            data = torch.load(shard_path, weights_only=False)
+
+            # Skip if already converted (int tensor, not list of strings)
+            if isinstance(data['labels'], torch.Tensor):
+                continue
+
+            labels_int   = [[label2id.get(l, label2id['<OOV>']) for l in row]
+                            for row in data['labels']]
+            d_labels_int = [[d_label2id[l] for l in row]
+                            for row in data['d_labels']]
+
+            data['labels']    = torch.tensor(labels_int,   dtype=torch.long)
+            data['d_labels']  = torch.tensor(d_labels_int, dtype=torch.long)
+            data['word_masks'] = torch.tensor(data['word_masks'], dtype=torch.long)
+
+            torch.save(data, shard_path)
+
+        # Invalidate cache so next __getitem__ reloads from updated files
+        self._cached_shard_idx  = -1
+        self._cached_shard_data = None
+
+    # ── indexing ───────────────────────────────────────────────────────────────
+
+    def __len__(self):
+        return self._cum_sizes[-1]
+
+    def _load_shard(self, shard_idx: int):
+        if self._cached_shard_idx != shard_idx:
+            self._cached_shard_data = torch.load(
+                self.shard_paths[shard_idx], weights_only=False
+            )
+            self._cached_shard_idx = shard_idx
+
+    def _find_shard(self, global_idx: int):
+        """Binary search → (shard_idx, local_idx)."""
+        lo, hi = 0, len(self._shard_sizes) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if global_idx < self._cum_sizes[mid + 1]:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo, global_idx - self._cum_sizes[lo]
+
+    def __getitem__(self, global_idx: int):
+        shard_idx, local_idx = self._find_shard(global_idx)
+        self._load_shard(shard_idx)
+        d = self._cached_shard_data
+        return {
+            'input_ids':      d['input_ids'][local_idx],
+            'attention_mask': d['attention_masks'][local_idx],
+            'd_labels':       d['d_labels'][local_idx],
+            'labels':         d['labels'][local_idx],
+            'word_masks':     d['word_masks'][local_idx],
+        }
+
+
+def _load_shards(manifest: dict, tokenizer, max_length: int) -> ShardedGECToRDataset:
+    """Return a lazy ShardedGECToRDataset — no tensors are cat'd in RAM."""
+    print(f"  Building lazy ShardedGECToRDataset over "
+          f"{len(manifest['shard_paths'])} shards …")
+    return ShardedGECToRDataset(manifest['shard_paths'], tokenizer, max_length)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -243,7 +326,7 @@ def load_dataset(
     max_length: int = 128,
     use_cache: bool = True,
     shard_size: int = SHARD_SIZE,
-) -> GECToRDataset:
+) -> 'GECToRDataset | ShardedGECToRDataset':
     """
     Load a GECToR-format dataset with sharded caching.
 

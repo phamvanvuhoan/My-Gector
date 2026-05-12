@@ -106,7 +106,7 @@ gector_image = (
     ])
     .add_commands([
         # Install your fork of gector
-        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git@beam-version"
+        "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
     ])
 )
 
@@ -283,36 +283,59 @@ def _maybe_override_batch(stage: int, batch_size: int):
 
 
 def cmd_preprocess(args):
-    preprocess_all.remote(model_id=args.model_id, max_len=args.max_len)
+    if args.detach:
+        # Fire-and-forget: .remote() returns immediately; job keeps running on Beam
+        # even after you close the terminal. Check progress with:
+        #   beam logs <task-id>
+        task = preprocess_all.remote(
+            model_id   = args.model_id,
+            max_len    = args.max_len,
+            shard_size = args.shard_size,
+            _detach    = True,           # Beam SDK flag: don't wait for result
+        )
+        print(f"✓ Preprocessing dispatched in detached mode.")
+        print(f"  Monitor with:  beam logs {task.id}")
+        print(f"  Cancel with:   beam cancel {task.id}")
+    else:
+        preprocess_all.remote(
+            model_id   = args.model_id,
+            max_len    = args.max_len,
+            shard_size = args.shard_size,
+        )
 
 
 def cmd_stage(args, stage: int):
     _maybe_override_batch(stage, args.batch_size)
-    save_dir = train_stage.remote(
-        stage       = stage,
-        model_id    = args.model_id,
-        restore_dir = args.restore_dir,
-        lr          = args.lr,
-        seed        = args.seed,
-    )
-    print(f"Stage {stage} done → {save_dir}")
+    if args.detach:
+        task = train_stage.remote(
+            stage       = stage,
+            model_id    = args.model_id,
+            restore_dir = args.restore_dir,
+            lr          = args.lr,
+            seed        = args.seed,
+            _detach     = True,
+        )
+        print(f"✓ Stage {stage} dispatched in detached mode.")
+        print(f"  Monitor with:  beam logs {task.id}")
+        print(f"  Cancel with:   beam cancel {task.id}")
+    else:
+        save_dir = train_stage.remote(
+            stage       = stage,
+            model_id    = args.model_id,
+            restore_dir = args.restore_dir,
+            lr          = args.lr,
+            seed        = args.seed,
+        )
+        print(f"Stage {stage} done → {save_dir}")
 
 
 def cmd_download(args):
-    """
-    Copy a trained checkpoint from the Beam Volume to your local machine
-    using the Beam CLI.  Equivalent to:
-        beam cp beam://gector-data/checkpoints/stage<N>/<which> <local_dir>
-    """
     import subprocess
     remote = f"beam://{VOLUME_NAME}/checkpoints/stage{args.stage}/{args.which}"
     local  = Path(args.local_dir)
     local.mkdir(parents=True, exist_ok=True)
     print(f"Downloading {remote} → {args.local_dir} …")
-    subprocess.run(
-        ["beam", "cp", remote, str(local)],
-        check=True
-    )
+    subprocess.run(["beam", "cp", remote, str(local)], check=True)
     print("✓ Download complete.")
 
 
@@ -324,19 +347,35 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # preprocess
-    p = sub.add_parser("preprocess", help="Tokenise & cache all datasets (CPU)")
-    p.add_argument("--model-id",  default="roberta-base")
-    p.add_argument("--max-len",   type=int, default=80)
+    # shared --detach flag added to every subcommand via parents
+    detach_parser = argparse.ArgumentParser(add_help=False)
+    detach_parser.add_argument(
+        "--detach", action="store_true",
+        help=(
+            "Fire-and-forget: dispatch the job and exit immediately. "
+            "The cloud process keeps running after you close your terminal. "
+            "Use 'beam logs <task-id>' to follow progress."
+        )
+    )
 
-    # stage1 / stage2 / stage3  (share the same args)
+    # preprocess
+    p = sub.add_parser("preprocess",
+                       help="Tokenise & cache all datasets (CPU)",
+                       parents=[detach_parser])
+    p.add_argument("--model-id",   default="roberta-base", dest="model_id")
+    p.add_argument("--max-len",    type=int, default=80, dest="max_len")
+    p.add_argument("--shard-size", type=int, default=500_000, dest="shard_size",
+                   help="Sentences per cache shard (lower if still OOM, e.g. 200000)")
+
+    # stage1 / stage2 / stage3
     for s in (1, 2, 3):
-        p = sub.add_parser(f"stage{s}", help=f"Train stage {s}")
-        p.add_argument("--model-id",    default="roberta-base")
-        p.add_argument("--restore-dir", default=None,
+        p = sub.add_parser(f"stage{s}", help=f"Train stage {s}",
+                           parents=[detach_parser])
+        p.add_argument("--model-id",    default="roberta-base", dest="model_id")
+        p.add_argument("--restore-dir", default=None, dest="restore_dir",
                        help="Override checkpoint path (default: auto from previous stage)")
-        p.add_argument("--batch-size",  type=int, default=0,
-                       help="Override default batch size (0 = use default)")
+        p.add_argument("--batch-size",  type=int, default=0, dest="batch_size",
+                       help="Override default batch size (0 = use stage default)")
         p.add_argument("--lr",          type=float, default=1e-5)
         p.add_argument("--seed",        type=int, default=10)
 
@@ -344,7 +383,7 @@ def build_parser():
     p = sub.add_parser("download", help="Download a checkpoint to your local machine")
     p.add_argument("--stage",     type=int, default=3)
     p.add_argument("--which",     default="best", choices=["best", "last"])
-    p.add_argument("--local-dir", default="outputs/beam_checkpoint")
+    p.add_argument("--local-dir", default="outputs/beam_checkpoint", dest="local_dir")
 
     return parser
 
