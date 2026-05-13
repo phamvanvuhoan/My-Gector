@@ -24,7 +24,7 @@ MOUNT  = "/gector-data"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .env({"FORCE_REBUILD": "2024-05-13"})
+    .env({"FORCE_REBUILD": "2024-05-14"})
     .apt_install("git")
     .pip_install(
         "torch>=2.6.0",
