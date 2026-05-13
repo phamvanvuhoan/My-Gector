@@ -212,11 +212,20 @@ def main(args):
 
     if args.restore_dir is not None:
         tokenizer = AutoTokenizer.from_pretrained(args.restore_dir)
+        label2id   = None   # loaded inside GECToR.from_pretrained
+        d_label2id = None
     else:
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_id,
             add_prefix_space=True
         )
+        if args.restore_vocab is not None:
+            label2id, d_label2id = load_vocab_from_config(args.restore_vocab)
+        elif args.restore_vocab_official is not None:
+            label2id, d_label2id = load_vocab_from_official(args.restore_vocab_official)
+        else:
+            label2id = d_label2id = None  # will build from data below
+
     tokenizer.add_special_tokens(
         {'additional_special_tokens': ['$START']}
     )
@@ -227,7 +236,9 @@ def main(args):
         'tokenizer': tokenizer,
         'delimeter': args.delimeter,
         'additional_delimeter': args.additional_delimeter,
-        'max_length': args.max_len
+        'max_length': args.max_len,
+        'label2id'              : label2id,      # <-- pass vocab
+        'd_label2id'            : d_label2id,    # <-- pass vocab
     }
     train_dataset = load_dataset(**dataset_args)
     dataset_args['input_file'] = args.valid_file
@@ -236,13 +247,7 @@ def main(args):
         # If you specify path or id to --restore_dir, the model loads weights and vocab.
         model = GECToR.from_pretrained(args.restore_dir)
     else:
-        # Otherwise, the model will be trained from scratch.
-        if args.restore_vocab is not None:
-            # But you can use existing vocab.
-            label2id, d_label2id = load_vocab_from_config(args.restore_vocab)
-        elif args.restore_vocab_official is not None:
-            label2id, d_label2id = load_vocab_from_official(args.restore_vocab_official)
-        else:
+        if label2id is not None:
             print('Builing vocab...')
             label2id, d_label2id = build_vocab(
                 train_dataset,

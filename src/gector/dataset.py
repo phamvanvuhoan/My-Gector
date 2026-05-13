@@ -49,6 +49,9 @@ class GECToRDataset:
     def append_vocab(self, label2id, d_label2id):
         self.label2id   = label2id
         self.d_label2id = d_label2id
+        if getattr(self, 'vocab_already_applied', False):
+            print("  Skipping append_vocab — already applied in cache")
+            return
         for i in range(len(self.labels)):
             self.labels[i]   = [label2id.get(l, label2id['<OOV>']) for l in self.labels[i]]
             self.d_labels[i] = [d_label2id[l] for l in self.d_labels[i]]
@@ -264,7 +267,7 @@ def load_dataset(
                                        dtype='int32', mode='r', shape=(n, max_length))
         word_masks_mm     = np.memmap(cache_file + '.word_masks.mmap',
                                        dtype='int32', mode='r', shape=(n, max_length))
-        return GECToRDataset(
+        dataset = GECToRDataset(
             srcs            = meta['srcs'],
             d_labels        = meta['d_labels'],
             labels          = meta['labels'],
@@ -274,6 +277,13 @@ def load_dataset(
             tokenizer       = tokenizer,
             max_length      = max_length,
         )
+
+        if meta.get('vocab_applied', False):
+            # labels are already integers — convert to tensors directly
+            dataset.labels   = torch.tensor(meta['labels'],   dtype=torch.long)
+            dataset.d_labels = torch.tensor(meta['d_labels'], dtype=torch.long)
+            dataset.vocab_already_applied = True   # skip append_vocab
+        return dataset
 
     srcs, word_level_labels = load_gector_format(
         input_file,
