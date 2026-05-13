@@ -82,35 +82,54 @@ class GECToRDataset:
         }
 
 def align_labels_to_subwords(
-    srcs: List[str],
-    word_level_labels: List[List[str]],
-    tokenizer: PreTrainedTokenizer,
+    srcs,
+    word_level_labels,
+    tokenizer,
     cache_file,
-    batch_size: int=50000,
-    max_length: int=128,
-    keep_label: str='$KEEP',
-    pad_token: str='<PAD>',
-    correct_label: str='$CORRECT',
-    incorrect_label: str='$INCORRECT'
+    batch_size=10000,      # reduce from 50000 — less RAM per chunk
+    max_length=128,
+    keep_label='$KEEP',
+    pad_token='<PAD>',
+    correct_label='$CORRECT',
+    incorrect_label='$INCORRECT',
+    commit_fn=None,        # <-- callable to flush volume, passed from modal
 ):
-    n = len(srcs)
-    print(f"Total sentences: {n}")
+    import numpy as np
+    import pickle
 
-    # pre-allocate memory-mapped arrays on disk — never fully in RAM
+    n          = len(srcs)
+    progress_file = cache_file + '.progress.pkl'  # tracks completed batches
+
+    # ── Resume state ──────────────────────────────────────────────
+    if os.path.exists(progress_file):
+        with open(progress_file, 'rb') as f:
+            progress = pickle.load(f)
+        start_batch    = progress['last_completed_batch'] + 1
+        subword_labels  = progress['subword_labels']
+        subword_d_labels = progress['subword_d_labels']
+        print(f"Resuming from batch {start_batch} ({start_batch * batch_size}/{n} sentences)")
+    else:
+        start_batch      = 0
+        subword_labels   = []
+        subword_d_labels = []
+        print(f"Starting fresh, {n} sentences total")
+
+    # ── Pre-allocate mmap (safe to call even if file exists) ──────
+    mode = 'r+' if os.path.exists(cache_file + '.input_ids.mmap') else 'w+'
     input_ids_mm      = np.memmap(cache_file + '.input_ids.mmap',
-                                   dtype='int32', mode='w+', shape=(n, max_length))
+                                   dtype='int32', mode=mode, shape=(n, max_length))
     attention_mask_mm = np.memmap(cache_file + '.attention_mask.mmap',
-                                   dtype='int32', mode='w+', shape=(n, max_length))
+                                   dtype='int32', mode=mode, shape=(n, max_length))
     word_masks_mm     = np.memmap(cache_file + '.word_masks.mmap',
-                                   dtype='int32', mode='w+', shape=(n, max_length))
-    # labels stay as lists until vocab is applied, then converted later
-    subword_labels   = []
-    subword_d_labels = []
+                                   dtype='int32', mode=mode, shape=(n, max_length))
 
     itr = list(range(0, n, batch_size))
-    written = 0
 
-    for i in tqdm(itr):
+    for batch_idx, i in enumerate(tqdm(itr)):
+        # skip already completed batches
+        if batch_idx < start_batch:
+            continue
+
         batch_srcs   = srcs[i:i+batch_size]
         batch_labels = word_level_labels[i:i+batch_size]
         batch_n      = len(batch_srcs)
@@ -124,52 +143,67 @@ def align_labels_to_subwords(
             is_split_into_words=True
         )
 
-        # write directly to mmap — no accumulation in RAM
-        input_ids_mm[written:written+batch_n]      = encode['input_ids'].numpy()
-        attention_mask_mm[written:written+batch_n] = encode['attention_mask'].numpy()
+        input_ids_mm[i:i+batch_n]      = encode['input_ids'].numpy()
+        attention_mask_mm[i:i+batch_n] = encode['attention_mask'].numpy()
 
         for j, wlabels in enumerate(batch_labels):
-            d_labels = []
-            labels   = []
-            wmask    = []
-            word_ids = encode.word_ids(j)
+            d_labels_row = []
+            labels_row   = []
+            wmask        = []
+            word_ids     = encode.word_ids(j)
             previous_word_idx = None
             for word_idx in word_ids:
                 if word_idx is None:
-                    labels.append(pad_token)
-                    d_labels.append(pad_token)
+                    labels_row.append(pad_token)
+                    d_labels_row.append(pad_token)
                     wmask.append(0)
                 elif word_idx != previous_word_idx:
                     l = wlabels[word_idx]
-                    labels.append(l)
+                    labels_row.append(l)
                     wmask.append(1)
-                    d_labels.append(
+                    d_labels_row.append(
                         incorrect_label if l != keep_label else correct_label
                     )
                 else:
-                    labels.append(pad_token)
-                    d_labels.append(pad_token)
+                    labels_row.append(pad_token)
+                    d_labels_row.append(pad_token)
                     wmask.append(0)
                 previous_word_idx = word_idx
-            subword_labels.append(labels)
-            subword_d_labels.append(d_labels)
+
+            subword_labels.append(labels_row)
+            subword_d_labels.append(d_labels_row)
+
             wmask_arr = np.array(wmask, dtype='int32')
-            # pad or truncate wmask to max_length
             if len(wmask_arr) < max_length:
                 wmask_arr = np.pad(wmask_arr, (0, max_length - len(wmask_arr)))
-            word_masks_mm[written+j] = wmask_arr[:max_length]
+            word_masks_mm[i+j] = wmask_arr[:max_length]
 
-        written += batch_n
-
-        # flush periodically to avoid OS page cache buildup
-        if (i // batch_size) % 10 == 0:
+        # ── Save progress every 5 batches ─────────────────────────
+        if batch_idx % 5 == 0:
             input_ids_mm.flush()
             attention_mask_mm.flush()
             word_masks_mm.flush()
 
+            with open(progress_file, 'wb') as f:
+                pickle.dump({
+                    'last_completed_batch': batch_idx,
+                    'subword_labels':       subword_labels,
+                    'subword_d_labels':     subword_d_labels,
+                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            if commit_fn is not None:
+                commit_fn()   # flush to Modal Volume
+
+            print(f"  Progress saved at batch {batch_idx} ({i+batch_n}/{n} sentences)")
+
+    # final flush
     input_ids_mm.flush()
     attention_mask_mm.flush()
     word_masks_mm.flush()
+
+    # cleanup progress file — preprocessing complete
+    if os.path.exists(progress_file):
+        os.remove(progress_file)
 
     return subword_d_labels, subword_labels, \
            input_ids_mm, attention_mask_mm, word_masks_mm
@@ -218,6 +252,7 @@ def load_dataset(
     batch_size: int = 50000,
     max_length: int = 128,
     use_cache: bool = True,        # <-- add
+    commit_fn  = None,    # <-- add
 ):
     cache_file = _cache_path(input_file, tokenizer, max_length)
     meta_file  = cache_file + '.meta.pt'
@@ -258,7 +293,8 @@ def load_dataset(
             tokenizer=tokenizer,
             cache_file=cache_file,
             batch_size=batch_size,
-            max_length=max_length
+            max_length=max_length,
+            commit_fn  = commit_fn,   # <-- add
         )
 
     if use_cache:

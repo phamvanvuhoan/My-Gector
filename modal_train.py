@@ -24,7 +24,7 @@ MOUNT  = "/gector-data"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .env({"FORCE_REBUILD": "2024-05-12"})
+    .env({"FORCE_REBUILD": "2024-05-13"})
     .apt_install("git")
     .pip_install(
         "torch>=2.6.0",
@@ -80,7 +80,7 @@ STAGE_CFG = {
 
 @app.function(
     image   = image,
-    cpu     = 8,           # more CPUs = faster tokenization
+    cpu     = 4,           # more CPUs = faster tokenization
     memory  = 49152,       # 48 GB — stage1 is 8.8M sentences
     volumes = {MOUNT: volume},
     timeout = 7200,        # 2 hours should be enough for all stages
@@ -136,6 +136,7 @@ def preprocess_all(
             tokenizer  = tokenizer,
             max_length = max_len,
             use_cache  = True,
+            commit_fn  = lambda: volume.commit(),   # <-- add
         )
 
         # flush to volume after each file so partial progress is saved
