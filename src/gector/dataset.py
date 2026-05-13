@@ -60,25 +60,20 @@ class GECToRDataset:
         return len(self.srcs)
 
     def __getitem__(self, idx):
-        # input_ids and attention_mask — handle both mmap and tensor
         if isinstance(self.input_ids, np.ndarray):
-            # mmap path
-            input_ids      = torch.from_numpy(np.array(self.input_ids[idx],      dtype='int32')).long()
-            attention_mask = torch.from_numpy(np.array(self.attention_masks[idx], dtype='int32')).long()
-            word_masks     = torch.from_numpy(np.array(self.word_masks[idx],      dtype='int32')).long()
-        else:
-            # tensor path (fallback)
-            input_ids      = self.input_ids[idx]
-            attention_mask = self.attention_masks[idx]
-            word_masks     = self.word_masks[idx]
-
-        # labels are always tensors after append_vocab()
+            return {
+                'input_ids':      torch.from_numpy(self.input_ids[idx].copy()),
+                'attention_mask': torch.from_numpy(self.attention_masks[idx].copy()),
+                'd_labels':       self.d_labels[idx],
+                'labels':         self.labels[idx],
+                'word_masks':     torch.from_numpy(self.word_masks[idx].copy()),
+            }
         return {
-            'input_ids':      input_ids,
-            'attention_mask': attention_mask,
+            'input_ids':      self.input_ids[idx],
+            'attention_mask': self.attention_masks[idx],
             'd_labels':       self.d_labels[idx],
             'labels':         self.labels[idx],
-            'word_masks':     word_masks,
+            'word_masks':     self.word_masks[idx],
         }
 
 def align_labels_to_subwords(
@@ -117,11 +112,11 @@ def align_labels_to_subwords(
     # ── Pre-allocate mmap (safe to call even if file exists) ──────
     mode = 'r+' if os.path.exists(cache_file + '.input_ids.mmap') else 'w+'
     input_ids_mm      = np.memmap(cache_file + '.input_ids.mmap',
-                                   dtype='int32', mode=mode, shape=(n, max_length))
+                                   dtype='int64', mode=mode, shape=(n, max_length))
     attention_mask_mm = np.memmap(cache_file + '.attention_mask.mmap',
-                                   dtype='int32', mode=mode, shape=(n, max_length))
+                                   dtype='int64', mode=mode, shape=(n, max_length))
     word_masks_mm     = np.memmap(cache_file + '.word_masks.mmap',
-                                   dtype='int32', mode=mode, shape=(n, max_length))
+                                   dtype='int64', mode=mode, shape=(n, max_length))
 
     itr = list(range(0, n, batch_size))
 

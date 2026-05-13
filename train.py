@@ -64,6 +64,7 @@ def train(
     save_dir,             # <-- add
     volume,               # <-- add
     ckpt_limit, # <-- add
+    use_accumulate,
     resume_step=0,        # <-- add (only non-zero on first resumed epoch)
 ):
     log = {
@@ -79,15 +80,22 @@ def train(
         # Skip steps already done before preemption
         if step < resume_step:
             continue
-
-        with accelerator.accumulate(model):
+        
+        if use_accumulate:
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+                loss = outputs.loss
+                optimizer.zero_grad()
+                accelerator.backward(loss)
+                optimizer.step()
+                if step_scheduler:
+                    lr_scheduler.step()
+        else:
             outputs = model(**batch)
             loss = outputs.loss
             optimizer.zero_grad()
             accelerator.backward(loss)
             optimizer.step()
-            if step_scheduler:
-                lr_scheduler.step()
 
         global_step += 1
         n_batches += 1
@@ -97,12 +105,13 @@ def train(
 
         if accelerator.is_main_process:
             pbar.set_description(f'[Epoch {epoch}] [TRAIN]')
-            pbar.set_postfix(OrderedDict(
-                loss=loss.item(),
-                accuracy=outputs.accuracy.item(),
-                accuracy_d=outputs.accuracy_d.item(),
-                lr=optimizer.param_groups[0]['lr']
-            ))
+            if global_step % 10 == 0:
+                pbar.set_postfix(OrderedDict(
+                    loss=loss.item(),
+                    accuracy=outputs.accuracy.item(),
+                    accuracy_d=outputs.accuracy_d.item(),
+                    lr=optimizer.param_groups[0]['lr']
+                ))
             # ── W&B step log ─────────────────────────────────────
             if wandb.run is not None and global_step % 50 ==0:
                 wandb.log({
@@ -125,7 +134,11 @@ def train(
                 print(f"  [step {global_step}] checkpoint saved → {ckpt_path}")
 
     n_batches = max(n_batches, 1)  # avoid div-by-zero if all steps were skipped
-    return {k: v / n_batches for k, v in log.items()}, global_step
+    return {
+        'loss':       log['loss'].item()       / n_batches,
+        'accuracy':   log['accuracy'].item()   / n_batches,
+        'accuracy_d': log['accuracy_d'].item() / n_batches,
+    }, global_step
 
 @torch.no_grad()
 def valid(
@@ -155,6 +168,15 @@ def valid(
             ))
     return {k:v/len(loader) for k,v in log.items()}
 
+def collate_fn(batch):
+    return {
+        'input_ids':      torch.stack([b['input_ids']      for b in batch]).pin_memory(),
+        'attention_mask': torch.stack([b['attention_mask'] for b in batch]).pin_memory(),
+        'd_labels':       torch.stack([b['d_labels']       for b in batch]).pin_memory(),
+        'labels':         torch.stack([b['labels']         for b in batch]).pin_memory(),
+        'word_masks':     torch.stack([b['word_masks']     for b in batch]).pin_memory(),
+    }
+
 def main(args):
     # To easily specify the model_id 
     args.model_id = solve_model_id(args.model_id)
@@ -170,6 +192,13 @@ def main(args):
     accelerator = Accelerator(gradient_accumulation_steps=args.accumulation,
                               project_dir=args.save_dir,
     )
+    # in train.py main(), add after accelerator is created
+    if args.accumulation == 1:
+        # skip accumulate context manager entirely
+        use_accumulate = False
+    else:
+        use_accumulate = True
+
     import wandb
     # only log from main process to avoid duplicate runs
     if accelerator.is_main_process and args.wandb_project:
@@ -259,19 +288,21 @@ def main(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=16,        # <-- add
-        pin_memory=True,      # <-- add, faster CPU→GPU transfer
+        pin_memory=False,      # <-- add, faster CPU→GPU transfer
         prefetch_factor=4,    # <-- prefetch 2 batches per worker
         persistent_workers=True,  # <-- keep workers alive between epochs
         multiprocessing_context='spawn',   # <-- add this for mmap safety
+        collate_fn  = collate_fn,
     )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=16,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,
         multiprocessing_context='spawn',   # <-- add this for mmap safety
+        collate_fn  = collate_fn,
     )
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -358,6 +389,7 @@ def main(args):
             save_dir=args.save_dir,                             # <-- add
             volume=volume,                                      # <-- add
             ckpt_limit=args.ckpt_limit, # <-- add
+            use_accumulate=use_accumulate,
             resume_step=resume_step if e == resume_epoch else 0,  # <-- add
         )
         valid_log = valid(

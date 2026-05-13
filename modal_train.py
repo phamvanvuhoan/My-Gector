@@ -41,7 +41,7 @@ image = (
     .add_local_file("train.py", "/root/train.py")   # <-- add this
 )
 
-GPU = "A100"  # swap to A10G() for cheaper runs; A100 recommended for stage1
+GPU = "A10G"  # swap to A10G() for cheaper runs; A100 recommended for stage1
 
 # ── Shared paths inside the volume ────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ STAGE_CFG = {
     1: dict(
         train_file  = f"{DATA}/stage1.train",
         valid_file  = f"{DATA}/stage1.dev",
-        batch_size  = 2048,
+        batch_size  = 512,
         n_cold_epochs = 2,
         n_epochs    = 10,
         save_dir    = f"{SAVE_BASE}/stage1",
@@ -61,7 +61,7 @@ STAGE_CFG = {
     2: dict(
         train_file  = f"{DATA}/stage2.train",
         valid_file  = f"{DATA}/stage2.dev",
-        batch_size  = 2048,
+        batch_size  = 512,
         n_cold_epochs = 2,
         n_epochs    = 10,
         save_dir    = f"{SAVE_BASE}/stage2",
@@ -145,6 +145,155 @@ def preprocess_all(
         print(f"✓ {name} cached and committed to volume")
 
     print("\n✓ All preprocessing done. Ready to train.")
+
+@app.function(
+    image   = image,
+    cpu     = 8,
+    memory  = 65536,
+    volumes = {MOUNT: volume},
+    timeout = 3600,
+)
+def apply_vocab_to_cache(
+    model_id: str = "roberta-base",
+    max_len:  int = 80,
+):
+    """
+    One-time step: load existing cache meta files, apply vocab,
+    save back. After this, training skips append_vocab entirely.
+    """
+    import torch
+    import numpy as np
+    import gc
+    from pathlib import Path
+    from transformers import AutoTokenizer
+    from gector import load_vocab_from_official
+
+    cache_dir = f"{MOUNT}/cache"
+    label2id, d_label2id = load_vocab_from_official(
+        f"{MOUNT}/data/output_vocabulary"
+    )
+    oov_id   = label2id['<OOV>']
+    d_pad_id = d_label2id['<PAD>']
+
+    meta_files = sorted(Path(cache_dir).glob("*.meta.pt"))
+    if not meta_files:
+        print("No meta files found in cache dir")
+        return
+
+    for meta_file in meta_files:
+        print(f"\nProcessing {meta_file.name} ...")
+        meta = torch.load(str(meta_file), weights_only=False)
+
+        if meta.get('vocab_applied', False):
+            print("  Already applied, skipping")
+            continue
+
+        print(f"  Applying vocab to {meta['n']:,} sentences...")
+        labels   = meta['labels']
+        d_labels = meta['d_labels']
+
+        # convert string labels to ints
+        print("  Converting labels...")
+        labels_int = [
+            [label2id.get(l, oov_id) for l in sent]
+            for sent in labels
+        ]
+        print("  Converting d_labels...")
+        d_labels_int = [
+            [d_label2id.get(l, d_pad_id) for l in sent]
+            for sent in d_labels
+        ]
+
+        # overwrite meta file with vocab-applied labels
+        print("  Saving updated meta...")
+        torch.save({
+            'n':            meta['n'],
+            'srcs':         meta['srcs'],
+            'labels':       labels_int,
+            'd_labels':     d_labels_int,
+            'vocab_applied': True,          # <-- flag so training skips append_vocab
+        }, str(meta_file))
+
+        del labels, d_labels, labels_int, d_labels_int
+        gc.collect()
+
+        volume.commit()
+        print(f"  ✓ Done and committed")
+
+    print("\n✓ All cache files updated. Training will now skip append_vocab.")
+
+
+@app.local_entrypoint()
+def apply_vocab():
+    apply_vocab_to_cache.spawn()
+
+@app.function(
+    image   = image,
+    cpu     = 8,
+    memory  = 16384,    # low memory needed — converts chunk by chunk
+    volumes = {MOUNT: volume},
+    timeout = 3600,
+)
+def convert_mmap_to_int64():
+    """
+    One-time conversion of existing int32 mmap files to int64.
+    Much faster than reprocessing from scratch.
+    """
+    import numpy as np
+    from pathlib import Path
+
+    cache_dir = f"{MOUNT}/cache"
+    mmap_files = sorted(Path(cache_dir).glob("*.mmap"))
+
+    if not mmap_files:
+        print("No mmap files found")
+        return
+
+    for mmap_file in mmap_files:
+        print(f"\nConverting {mmap_file.name} ...")
+
+        # read shape from existing int32 file
+        old = np.memmap(str(mmap_file), dtype='int32', mode='r')
+        total_elements = old.shape[0]
+
+        # read meta to get (n, max_length) shape
+        # infer from file size: total_elements = n * max_length
+        # we know max_length=80 from training config
+        max_length = 80
+        n = total_elements // max_length
+        old = np.memmap(str(mmap_file), dtype='int32', mode='r', shape=(n, max_length))
+
+        size_gb = mmap_file.stat().st_size / 1e9
+        print(f"  Shape: ({n}, {max_length}), size: {size_gb:.2f} GB")
+
+        # write to temp file as int64
+        tmp_file = str(mmap_file) + '.int64.tmp'
+        new = np.memmap(tmp_file, dtype='int64', mode='w+', shape=(n, max_length))
+
+        # convert in chunks to avoid RAM spike
+        chunk = 50000
+        for i in range(0, n, chunk):
+            new[i:i+chunk] = old[i:i+chunk].astype('int64')
+            if i % 500000 == 0:
+                new.flush()
+                print(f"  {i}/{n} rows converted...")
+
+        new.flush()
+        del old, new
+
+        # replace original with converted file
+        import os, shutil
+        os.replace(tmp_file, str(mmap_file))
+        print(f"  ✓ Converted {mmap_file.name}")
+
+        volume.commit()
+
+    print("\n✓ All mmap files converted to int64")
+
+
+@app.local_entrypoint()
+def convert_cache():
+    convert_mmap_to_int64.remote()
 
 # Verify cache integrity before training — run this to check for any issues with the cached files that could cause training to fail. This is especially useful if you had an interruption during preprocessing or if you want to sanity-check the cache before launching a long training run.
 @app.function(
