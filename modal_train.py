@@ -293,7 +293,7 @@ def convert_mmap_to_int64():
 
 @app.local_entrypoint()
 def convert_cache():
-    convert_mmap_to_int64.remote()
+    convert_mmap_to_int64.spawn()
 
 # Verify cache integrity before training — run this to check for any issues with the cached files that could cause training to fail. This is especially useful if you had an interruption during preprocessing or if you want to sanity-check the cache before launching a long training run.
 @app.function(
