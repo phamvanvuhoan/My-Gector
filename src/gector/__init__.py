@@ -20,6 +20,6 @@ __all__ = [
     'build_vocab',
     'load_vocab_from_config',
     'load_vocab_from_official',
-    'beam_predict'
+    'beam_predict',
     'SkipDataset'
 ]

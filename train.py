@@ -256,7 +256,7 @@ def main(args):
         print(f"Resumed: global_step={global_step}, "
               f"epoch={resume_epoch}, step_in_epoch={resume_step}")
     # If we're resuming mid-epoch, skip already-seen samples
-    skip_n = resume_step * args.batch_size  # batches → samples
+    skip_n = min(resume_step * args.batch_size, len(train_dataset) - 1)  # batches → samples
     if skip_n > 0 and skip_n < len(train_dataset):
         print(f"Resuming mid-epoch: skipping first {skip_n:,} samples ({resume_step} batches)")
         resumed_train_dataset = SkipDataset(train_dataset, skip_n)
@@ -361,6 +361,7 @@ def main(args):
         elif epoch == args.n_cold_epochs:
             module.tune_bert(True)
             _set_lr(optimizer, args.lr)
+            step_scheduler = True
         else:
             # Resuming into a warm epoch — ensure bert is unfrozen and LR is correct
             module.tune_bert(True)
