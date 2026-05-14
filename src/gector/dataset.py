@@ -229,7 +229,7 @@ def build_cache(
 
             for word_idx in encoded.word_ids(j):
                 if word_idx is None:
-                    label_row.append(d_pad_id)       # <PAD> id
+                    label_row.append(label2id[pad_token])       # <PAD> id
                     d_label_row.append(d_pad_id)
                     wmask.append(0)
                 elif word_idx != prev_word:
