@@ -75,6 +75,7 @@ def train(
     n_batches = 0  # track actual batches run (skip doesn't count)
     model.train()
     pbar = tqdm(loader, total=len(loader), disable=not accelerator.is_main_process)
+
     for step, batch in enumerate(pbar):
 
         # Skip steps already done before preemption
@@ -168,15 +169,6 @@ def valid(
             ))
     return {k:v/len(loader) for k,v in log.items()}
 
-def collate_fn(batch):
-    return {
-        'input_ids':      torch.stack([b['input_ids']      for b in batch]).pin_memory(),
-        'attention_mask': torch.stack([b['attention_mask'] for b in batch]).pin_memory(),
-        'd_labels':       torch.stack([b['d_labels']       for b in batch]).pin_memory(),
-        'labels':         torch.stack([b['labels']         for b in batch]).pin_memory(),
-        'word_masks':     torch.stack([b['word_masks']     for b in batch]).pin_memory(),
-    }
-
 def main(args):
     # To easily specify the model_id 
     args.model_id = solve_model_id(args.model_id)
@@ -237,8 +229,8 @@ def main(args):
         'delimeter': args.delimeter,
         'additional_delimeter': args.additional_delimeter,
         'max_length': args.max_len,
-        'label2id'              : label2id,      # <-- pass vocab
-        'd_label2id'            : d_label2id,    # <-- pass vocab
+        #'label2id'              : label2id,      # <-- pass vocab
+        #'d_label2id'            : d_label2id,    # <-- pass vocab
     }
     train_dataset = load_dataset(**dataset_args)
     dataset_args['input_file'] = args.valid_file
@@ -292,22 +284,20 @@ def main(args):
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=16,        # <-- add
-        pin_memory=False,      # <-- add, faster CPU→GPU transfer
-        prefetch_factor=4,    # <-- prefetch 2 batches per worker
+        num_workers=8,        # <-- add
+        pin_memory=True,      # <-- add, faster CPU→GPU transfer
+        prefetch_factor=2,    # <-- prefetch 2 batches per worker
         persistent_workers=True,  # <-- keep workers alive between epochs
         multiprocessing_context='spawn',   # <-- add this for mmap safety
-        collate_fn  = collate_fn,
     )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=16,
-        pin_memory=False,
+        num_workers=8,
+        pin_memory=True,
         persistent_workers=True,
         multiprocessing_context='spawn',   # <-- add this for mmap safety
-        collate_fn  = collate_fn,
     )
     optimizer = torch.optim.Adam(
         model.parameters(),

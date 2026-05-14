@@ -171,7 +171,7 @@ def align_labels_to_subwords(
             subword_labels.append(labels_row)
             subword_d_labels.append(d_labels_row)
 
-            wmask_arr = np.array(wmask, dtype='int32')
+            wmask_arr = np.array(wmask, dtype='int64')
             if len(wmask_arr) < max_length:
                 wmask_arr = np.pad(wmask_arr, (0, max_length - len(wmask_arr)))
             word_masks_mm[i+j] = wmask_arr[:max_length]
@@ -262,11 +262,11 @@ def load_dataset(
 
         # load as mmap — only pages actually accessed are read from disk
         input_ids_mm      = np.memmap(cache_file + '.input_ids.mmap',
-                                       dtype='int32', mode='r', shape=(n, max_length))
+                                       dtype='int64', mode='r', shape=(n, max_length))
         attention_mask_mm = np.memmap(cache_file + '.attention_mask.mmap',
-                                       dtype='int32', mode='r', shape=(n, max_length))
+                                       dtype='int64', mode='r', shape=(n, max_length))
         word_masks_mm     = np.memmap(cache_file + '.word_masks.mmap',
-                                       dtype='int32', mode='r', shape=(n, max_length))
+                                       dtype='int64', mode='r', shape=(n, max_length))
         dataset = GECToRDataset(
             srcs            = meta['srcs'],
             d_labels        = meta['d_labels'],

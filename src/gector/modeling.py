@@ -142,6 +142,9 @@ class GECToR(PreTrainedModel):
             # -100 is the default ignore_idx of CrossEntropyLoss
             labels[labels == pad_id] = -100
             d_labels[labels == -100] = -100
+            # Weight tensor must move with the model; handle device mismatch:
+            if self.loss_fn.weight is not None:
+                self.loss_fn.weight = self.loss_fn.weight.to(logits_labels.device)
             loss_d = self.loss_fn_d(          # use unweighted loss for detection
                 logits_d.view(-1, self.config.d_num_labels - 1),
                 d_labels.view(-1)
@@ -150,9 +153,6 @@ class GECToR(PreTrainedModel):
                 logits_labels.view(-1, self.config.num_labels - 1),
                 labels.view(-1)
             )
-            # Weight tensor must move with the model; handle device mismatch:
-            if self.loss_fn.weight is not None:
-                self.loss_fn.weight = self.loss_fn.weight.to(logits_labels.device)
             loss = loss_d + loss_labels
 
             pred_labels = torch.argmax(logits_labels, dim=-1)
