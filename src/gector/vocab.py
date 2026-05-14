@@ -2,6 +2,8 @@ from .configuration import GECToRConfig
 from .dataset import GECToRDataset
 import os
 import torch
+from tqdm import tqdm
+
 
 def build_vocab(
     train_dataset: GECToRDataset,
@@ -36,7 +38,6 @@ def load_vocab_from_config(config_file: str):
 def load_vocab_from_official(dir):
     vocab_path = os.path.join(dir, 'labels.txt')
     vocab = open(vocab_path).read().replace('@@PADDING@@', '').replace('@@UNKNOWN@@', '').rstrip().split('\n')
-    # vocab_d = open(dir + 'd_tags.txt').read().rstrip().replace('@@PADDING@@', '<PAD>').replace('@@UNKNOWN@@', '<OOV>').split('\n')
     label2id = {'<OOV>':0, '$KEEP':1}
     d_label2id = {'$CORRECT':0, '$INCORRECT':1, '<PAD>':2}
     idx = len(label2id)
@@ -48,27 +49,33 @@ def load_vocab_from_official(dir):
     return label2id, d_label2id
 
 def compute_class_weights(
-    dataset,
+    dataset: GECToRDataset,
     label2id: dict,
     strategy: str = 'sqrt_inverse_freq',
     max_weight: float = 10.0,
 ) -> torch.Tensor:
+    """
+    Count label frequencies from the mmap and return per-class weights.
+
+    The mmap is int32; we read in chunks and accumulate into a float64
+    counter — no cast to int64 needed.
+    """
     n_labels = len(label2id)
-    counts   = torch.zeros(n_labels, dtype=torch.float)
+    counts   = torch.zeros(n_labels, dtype=torch.float64)
     pad_id   = label2id['<PAD>']
 
     print("Computing class weights from label mmap ...")
-    # labels mmap is (n, max_length) int64
-    # flatten and count, excluding pad (-100 after masking, but here still pad_id)
     chunk = 100_000
     for i in tqdm(range(0, len(dataset), chunk)):
+        # dataset.labels is int32 mmap; read a slice and cast to int64 for
+        # scatter_add_ (which requires a Long index tensor).
         batch = torch.from_numpy(
-            dataset.labels[i:i+chunk].copy()
-        ).flatten()
+            dataset.labels[i : i + chunk].copy()
+        ).to(torch.long).flatten()
         valid = batch[batch != pad_id]
-        counts.scatter_add_(0, valid, torch.ones_like(valid, dtype=torch.float))
+        counts.scatter_add_(0, valid, torch.ones_like(valid, dtype=torch.float64))
 
-    counts = counts.clamp(min=1.0)
+    counts = counts.float().clamp(min=1.0)
     if strategy == 'inverse_freq':
         weights = 1.0 / counts
     elif strategy == 'sqrt_inverse_freq':
@@ -80,6 +87,6 @@ def compute_class_weights(
     weights = weights.clamp(max=max_weight)
     weights[pad_id] = 0.0
 
+    # Drop the <PAD> slot — the projection layer has (num_labels - 1) outputs.
     keep_ids = [i for i in range(n_labels) if i != pad_id]
     return weights[keep_ids]
-        

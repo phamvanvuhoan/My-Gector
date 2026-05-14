@@ -59,6 +59,36 @@ def _prune_checkpoints(save_dir: str, limit: int) -> None:
         print(f"  Pruned checkpoint: {old}")
 
 
+def _make_dataloader(
+    dataset,
+    batch_size:  int,
+    shuffle:     bool,
+    num_workers: int,
+    prefetch:    int,
+) -> DataLoader:
+    """
+    Build a DataLoader with settings tuned for mmap datasets on Linux (Modal).
+
+    Key choices vs the original:
+    - multiprocessing_context="fork"  — avoids the spawn re-import tax; safe on
+      Linux because we never use CUDA in worker processes.
+    - prefetch_factor=4               — deeper queue so workers stay ahead of GPU.
+    - persistent_workers=True         — workers keep their mmap fd open across
+      epochs (no re-open cost).
+    - pin_memory=True                 — DMA-friendly host→device transfer.
+    """
+    return DataLoader(
+        dataset,
+        batch_size              = batch_size,
+        shuffle                 = shuffle,
+        num_workers             = num_workers,
+        pin_memory              = True,
+        prefetch_factor         = 4,          # was 2; deeper prefetch queue
+        persistent_workers      = True,
+        multiprocessing_context = "fork",     # was "spawn"; 2-3× lower startup cost on Linux
+    )
+
+
 # ── Train / validation loops ──────────────────────────────────────────────────
 
 def train_epoch(
@@ -229,24 +259,19 @@ def main(args):
         model = GECToR(config=config)
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
-    train_loader = DataLoader(
+    train_loader = _make_dataloader(
         train_dataset,
-        batch_size         = args.batch_size,
-        shuffle            = True,
-        num_workers        = 8,
-        pin_memory         = True,
-        prefetch_factor    = 2,
-        persistent_workers = True,
-        multiprocessing_context = "spawn",
+        batch_size  = args.batch_size,
+        shuffle     = True,
+        num_workers = 8,
+        prefetch    = 4,
     )
-    valid_loader = DataLoader(
+    valid_loader = _make_dataloader(
         valid_dataset,
-        batch_size         = args.batch_size,
-        shuffle            = False,
-        num_workers        = 4,
-        pin_memory         = True,
-        persistent_workers = True,
-        multiprocessing_context = "spawn",
+        batch_size  = args.batch_size,
+        shuffle     = False,
+        num_workers = 4,
+        prefetch    = 4,
     )
 
     # ── Optimizer & scheduler ────────────────────────────────────────────────
@@ -326,14 +351,14 @@ def main(args):
         print(f"=== Epoch {epoch} ===")
         train_log, global_step = train_epoch(
             model, train_loader, optimizer, lr_scheduler, accelerator,
-            epoch        = epoch,
+            epoch          = epoch,
             step_scheduler = step_scheduler,
-            global_step  = global_step,
-            ckpt_steps   = args.ckpt_steps,
-            ckpt_limit   = args.ckpt_limit,
-            save_dir     = args.save_dir,
+            global_step    = global_step,
+            ckpt_steps     = args.ckpt_steps,
+            ckpt_limit     = args.ckpt_limit,
+            save_dir       = args.save_dir,
             use_accumulate = use_accumulate,
-            resume_step  = resume_step if epoch == resume_epoch else 0,
+            resume_step    = resume_step if epoch == resume_epoch else 0,
         )
         valid_log = valid_epoch(model, valid_loader, accelerator, epoch)
 
