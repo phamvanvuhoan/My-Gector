@@ -91,6 +91,7 @@ def align_labels_to_subwords(
     correct_label='$CORRECT',
     incorrect_label='$INCORRECT',
     commit_fn=None,        # <-- callable to flush volume, passed from modal
+    skip_tensor_mmaps=False,  # if True, don't write input_ids/attention_masks/word_masks (used when these already exist in cache and we're just rebuilding label mmaps
 ):
     import numpy as np
     import pickle
@@ -141,8 +142,10 @@ def align_labels_to_subwords(
             is_split_into_words=True
         )
 
-        input_ids_mm[i:i+batch_n]      = encode['input_ids'].numpy()
-        attention_mask_mm[i:i+batch_n] = encode['attention_mask'].numpy()
+        # in the batch loop, wrap mmap writes with the flag:
+        if not skip_tensor_mmaps:
+            input_ids_mm[i:i+batch_n]      = encode['input_ids'].numpy()
+            attention_mask_mm[i:i+batch_n] = encode['attention_mask'].numpy()
 
         for j, wlabels in enumerate(batch_labels):
             d_labels_row = []
@@ -249,42 +252,168 @@ def load_dataset(
     additional_delimeter: str = 'SEPL__SEPR',
     batch_size: int = 50000,
     max_length: int = 128,
-    use_cache: bool = True,        # <-- add
-    commit_fn  = None,    # <-- add
+    use_cache: bool = True,
+    commit_fn=None,
 ):
     cache_file = _cache_path(input_file, tokenizer, max_length)
     meta_file  = cache_file + '.meta.pt'
 
-    if use_cache and os.path.exists(meta_file):
-        print(f"✓ Cache hit: {cache_file}")
-        meta = torch.load(meta_file)
-        n    = meta['n']
+    input_ids_path      = cache_file + '.input_ids.mmap'
+    attention_mask_path = cache_file + '.attention_mask.mmap'
+    word_masks_path     = cache_file + '.word_masks.mmap'
+    labels_path         = cache_file + '.labels.mmap'
+    d_labels_path       = cache_file + '.d_labels.mmap'
 
-        # load as mmap — only pages actually accessed are read from disk
-        input_ids_mm      = np.memmap(cache_file + '.input_ids.mmap',
-                                       dtype='int64', mode='r', shape=(n, max_length))
-        attention_mask_mm = np.memmap(cache_file + '.attention_mask.mmap',
-                                       dtype='int64', mode='r', shape=(n, max_length))
-        word_masks_mm     = np.memmap(cache_file + '.word_masks.mmap',
-                                       dtype='int64', mode='r', shape=(n, max_length))
-        dataset = GECToRDataset(
-            srcs            = meta['srcs'],
-            d_labels        = meta['d_labels'],
-            labels          = meta['labels'],
-            word_masks      = word_masks_mm,
-            input_ids       = input_ids_mm,
-            attention_masks = attention_mask_mm,
-            tokenizer       = tokenizer,
-            max_length      = max_length,
-        )
+    # ── Helper: infer n from mmap file size ───────────────────────────────────
+    def infer_n_from_mmap(path, max_length):
+        return os.path.getsize(path) // (max_length * 4)  # int32 = 4 bytes
 
-        if meta.get('vocab_applied', False):
-            # labels are already integers — convert to tensors directly
-            dataset.labels   = torch.tensor(meta['labels'],   dtype=torch.long)
-            dataset.d_labels = torch.tensor(meta['d_labels'], dtype=torch.long)
-            dataset.vocab_already_applied = True   # skip append_vocab
-        return dataset
+    # ── Helper: load minimal meta, rebuild if fat/corrupt ────────────────────
+    def load_or_rebuild_meta():
+        """
+        Returns (n, vocab_applied).
+        If meta is missing, corrupt, or fat (>1MB), infers n from mmap
+        and writes a fresh minimal meta.
+        """
+        # no meta at all — infer from mmap if possible
+        if not os.path.exists(meta_file):
+            if os.path.exists(input_ids_path):
+                n = infer_n_from_mmap(input_ids_path, max_length)
+                has_label_mmaps = (
+                    os.path.exists(labels_path) and
+                    os.path.exists(d_labels_path)
+                )
+                _write_meta(meta_file, n, has_label_mmaps)
+                print(f"  Rebuilt missing meta: n={n:,}, vocab_applied={has_label_mmaps}")
+                return n, has_label_mmaps
+            return None, False  # nothing exists yet
 
+        # meta exists — check if it's fat (old format with srcs/labels lists)
+        size_mb = os.path.getsize(meta_file) / 1e6
+        if size_mb > 1.0:
+            print(f"  Fat meta detected ({size_mb:.0f} MB) — rebuilding from mmap...")
+            if os.path.exists(input_ids_path):
+                n = infer_n_from_mmap(input_ids_path, max_length)
+                has_label_mmaps = (
+                    os.path.exists(labels_path) and
+                    os.path.exists(d_labels_path)
+                )
+                _write_meta(meta_file, n, has_label_mmaps)
+                print(f"  Rebuilt meta: n={n:,}, vocab_applied={has_label_mmaps}")
+                return n, has_label_mmaps
+            else:
+                # fat meta but no mmaps — delete and reprocess from scratch
+                os.remove(meta_file)
+                return None, False
+
+        # meta is small — try loading it
+        try:
+            meta = torch.load(meta_file, weights_only=True)
+            return meta['n'], meta.get('vocab_applied', False)
+        except Exception as e:
+            print(f"  Corrupt meta ({e}) — rebuilding...")
+            if os.path.exists(input_ids_path):
+                n = infer_n_from_mmap(input_ids_path, max_length)
+                has_label_mmaps = (
+                    os.path.exists(labels_path) and
+                    os.path.exists(d_labels_path)
+                )
+                _write_meta(meta_file, n, has_label_mmaps)
+                return n, has_label_mmaps
+            os.remove(meta_file)
+            return None, False
+
+    def _write_meta(path, n, vocab_applied):
+        tmp = path + '.tmp'
+        torch.save({'n': n, 'vocab_applied': vocab_applied}, tmp)
+        os.replace(tmp, path)  # atomic on Linux
+
+    # ── Check what exists ─────────────────────────────────────────────────────
+    tensor_mmaps_exist = (
+        os.path.exists(input_ids_path) and
+        os.path.exists(attention_mask_path) and
+        os.path.exists(word_masks_path)
+    )
+
+    if use_cache and tensor_mmaps_exist:
+        n, vocab_applied = load_or_rebuild_meta()
+
+        if n is not None:
+            print(f"✓ Cache hit: {cache_file} (n={n:,})")
+
+            input_ids_mm      = np.memmap(input_ids_path,
+                                           dtype='int32', mode='r', shape=(n, max_length))
+            attention_mask_mm = np.memmap(attention_mask_path,
+                                           dtype='int32', mode='r', shape=(n, max_length))
+            word_masks_mm     = np.memmap(word_masks_path,
+                                           dtype='int32', mode='r', shape=(n, max_length))
+
+            # ── Apply vocab to label mmaps if not done yet ────────────────
+            if not vocab_applied:
+                print("  Label mmaps missing — building from raw data + vocab...")
+                # need to reload raw string labels from source file
+                srcs, word_level_labels = load_gector_format(
+                    input_file,
+                    delimeter=delimeter,
+                    additional_delimeter=additional_delimeter
+                )
+                assert len(srcs) == n, \
+                    f"Source file row count ({len(srcs)}) != mmap n ({n})"
+
+                # we need a tokenizer + vocab to build label mmaps
+                # vocab must be passed in — caller should provide label2id
+                # defer: return dataset with vocab_already_applied=False
+                # so append_vocab() handles it the old way
+                # (this path only hits if apply_vocab was never run)
+                print("  WARNING: label mmaps not found and vocab not applied.")
+                print("  Will apply vocab in-memory via append_vocab().")
+
+                dataset = GECToRDataset(
+                    srcs            = srcs,
+                    d_labels        = None,   # built during align
+                    labels          = None,
+                    word_masks      = word_masks_mm,
+                    input_ids       = input_ids_mm,
+                    attention_masks = attention_mask_mm,
+                    tokenizer       = tokenizer,
+                    max_length      = max_length,
+                )
+                # re-run label alignment only (tensor mmaps already exist)
+                d_labels, labels, _, _, _ = align_labels_to_subwords(
+                    srcs,
+                    word_level_labels,
+                    tokenizer=tokenizer,
+                    cache_file=cache_file,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    commit_fn=commit_fn,
+                    skip_tensor_mmaps=True,   # don't rewrite input_ids/mask/word_masks
+                )
+                dataset.d_labels = d_labels
+                dataset.labels   = labels
+                return dataset
+
+            # ── Happy path: label mmaps exist ────────────────────────────
+            labels_mm   = np.memmap(labels_path,
+                                     dtype='int32', mode='r', shape=(n, max_length))
+            d_labels_mm = np.memmap(d_labels_path,
+                                     dtype='int32', mode='r', shape=(n, max_length))
+
+            dataset = GECToRDataset(
+                srcs            = None,
+                d_labels        = d_labels_mm,
+                labels          = labels_mm,
+                word_masks      = word_masks_mm,
+                input_ids       = input_ids_mm,
+                attention_masks = attention_mask_mm,
+                tokenizer       = tokenizer,
+                max_length      = max_length,
+            )
+            dataset.vocab_already_applied = True
+            return dataset
+
+    # ── No cache — process from scratch ──────────────────────────────────────
+    print(f"No cache found, processing {input_file} ...")
     srcs, word_level_labels = load_gector_format(
         input_file,
         delimeter=delimeter,
@@ -299,17 +428,11 @@ def load_dataset(
             cache_file=cache_file,
             batch_size=batch_size,
             max_length=max_length,
-            commit_fn  = commit_fn,   # <-- add
+            commit_fn=commit_fn,
         )
 
     if use_cache:
-        print(f"Saving cache metadata to {meta_file} ...")
-        torch.save({
-            'n':        len(srcs),
-            'srcs':     srcs,
-            'd_labels': d_labels,   # still lists, vocab not applied yet
-            'labels':   labels,
-        }, meta_file)
+        _write_meta(meta_file, len(srcs), vocab_applied=False)
 
     return GECToRDataset(
         srcs            = srcs,

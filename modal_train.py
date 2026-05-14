@@ -16,6 +16,8 @@ import os
 import modal
 from pathlib import Path
 
+from gector.vocab import load_vocab_from_official
+
 # ── Infrastructure ─────────────────────────────────────────────────────────────
 
 app    = modal.App("gector-train")
@@ -24,7 +26,7 @@ MOUNT  = "/gector-data"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .env({"FORCE_REBUILD": "2024-05-15"})
+    .env({"FORCE_REBUILD": "2024-05-17"})
     .apt_install("git")
     .pip_install(
         "torch>=2.6.0",
@@ -101,6 +103,34 @@ def preprocess_all(
     from transformers import AutoTokenizer
     from gector import load_dataset
 
+    def _save_label_mmaps(dataset, input_file, tokenizer, max_len, label2id, d_label2id):
+        """Write label tensors to mmap files and update meta to vocab_applied=True."""
+        from gector.dataset import _cache_path
+        import numpy as np
+        import torch
+
+        cache_file  = _cache_path(input_file, tokenizer, max_len)
+        labels_path   = cache_file + '.labels.mmap'
+        d_labels_path = cache_file + '.d_labels.mmap'
+        meta_file     = cache_file + '.meta.pt'
+        n = len(dataset)
+
+        labels_mm   = np.memmap(labels_path,   dtype='int32', mode='w+', shape=(n, max_len))
+        d_labels_mm = np.memmap(d_labels_path, dtype='int32', mode='w+', shape=(n, max_len))
+
+        # dataset.labels and d_labels are now tensors after append_vocab
+        labels_mm[:]   = dataset.labels.numpy().astype('int32')
+        d_labels_mm[:] = dataset.d_labels.numpy().astype('int32')
+
+        labels_mm.flush()
+        d_labels_mm.flush()
+
+        # update meta atomically
+        tmp = meta_file + '.tmp'
+        torch.save({'n': n, 'vocab_applied': True}, tmp)
+        os.replace(tmp, meta_file)
+        print(f"  Label mmaps saved: {labels_path}")
+
     cache_dir = f"{MOUNT}/cache"
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["GECTOR_CACHE_DIR"] = cache_dir
@@ -112,6 +142,9 @@ def preprocess_all(
     tokenizer.add_special_tokens(
         {'additional_special_tokens': ['$START']}
     )
+
+    # load vocab once — shared across all stages
+    label2id, d_label2id = load_vocab_from_official(f"{MOUNT}/data/output_vocabulary")
 
     stages = [
         (f"{MOUNT}/data/stage1.train", "stage1 train"),
@@ -131,13 +164,24 @@ def preprocess_all(
         print(f"Processing {name} ...")
         print(f"{'='*50}")
 
-        load_dataset(
+        dataset =load_dataset(
             input_file = file_path,
             tokenizer  = tokenizer,
             max_length = max_len,
             use_cache  = True,
             commit_fn  = lambda: volume.commit(),   # <-- add
         )
+
+                # apply vocab → writes .labels.mmap and .d_labels.mmap
+        if not getattr(dataset, 'vocab_already_applied', False):
+            print(f"  Applying vocab for {name}...")
+            dataset.append_vocab(label2id, d_label2id)
+            # now persist label mmaps to volume
+            _save_label_mmaps(dataset, file_path, tokenizer, max_len, label2id, d_label2id)
+            volume.commit()
+            print(f"  ✓ Vocab applied and committed")
+        else:
+            print(f"  ✓ Vocab already applied, skipping")
 
         # flush to volume after each file so partial progress is saved
         # if this function gets interrupted
@@ -205,14 +249,23 @@ def apply_vocab_to_cache(
         ]
 
         # overwrite meta file with vocab-applied labels
-        print("  Saving updated meta...")
-        torch.save({
-            'n':            meta['n'],
-            'srcs':         meta['srcs'],
-            'labels':       labels_int,
-            'd_labels':     d_labels_int,
-            'vocab_applied': True,          # <-- flag so training skips append_vocab
-        }, str(meta_file))
+        print("  Create new memmaps for vocab-applied labels...")
+        labels_mm = np.memmap(
+            cache_dir + '.labels.mmap',
+            dtype='int32', mode='w+', shape=(n, max_length)  # need max_length from meta
+        )
+        d_labels_mm = np.memmap(
+            cache_dir + '.d_labels.mmap', 
+            dtype='int32', mode='w+', shape=(n, max_length)
+        )
+
+        for i, (row, d_row) in enumerate(zip(labels_int, d_labels_int)):
+            arr = np.array(row, dtype='int32')
+            labels_mm[i, :len(arr)] = arr
+            # pad remainder already 0 from w+ mode
+
+        # save minimal meta — just n and flag
+        torch.save({'n': n, 'vocab_applied': True}, str(meta_file))
 
         del labels, d_labels, labels_int, d_labels_int
         gc.collect()
@@ -417,6 +470,101 @@ def verify_cache():
 @app.local_entrypoint()
 def verify():
     verify_cache.remote()
+
+@app.function(image=image, volumes={MOUNT: volume}, cpu=2, memory=4096)
+def inspect_cache():
+    import os
+    from pathlib import Path
+    
+    cache_dir = f"{MOUNT}/cache"
+    for f in sorted(Path(cache_dir).glob("*.meta.pt")):
+        size_mb = f.stat().st_size / 1e6
+        print(f"{f.name}: {size_mb:.1f} MB")
+        
+        # Try to load with a timeout signal
+        import signal
+        def handler(sig, frame):
+            raise TimeoutError("torch.load hung")
+        signal.signal(signal.SIGALRM, handler)
+        signal.alarm(10)  # 10 second timeout
+        try:
+            import torch
+            meta = torch.load(str(f), weights_only=False)
+            signal.alarm(0)
+            print(f"  OK — n={meta.get('n')}, keys={list(meta.keys())}")
+        except TimeoutError:
+            print(f"  CORRUPT — torch.load hung after 10s, file is truncated")
+        except Exception as e:
+            print(f"  ERROR — {e}")
+
+@app.local_entrypoint()
+def check_meta():
+    inspect_cache.remote()
+
+@app.function(image=image, volumes={MOUNT: volume}, cpu=2, memory=512)
+def nuke_meta_files():
+    from pathlib import Path
+    cache_dir = f"{MOUNT}/cache"
+    for f in Path(cache_dir).glob("*.meta.pt"):
+        size_mb = f.stat().st_size / 1e6
+        print(f"Deleting {f.name} ({size_mb:.0f} MB)")
+        f.unlink()
+    # also delete any .tmp leftover from interrupted saves
+    for f in Path(cache_dir).glob("*.tmp"):
+        f.unlink()
+        print(f"Deleted tmp: {f.name}")
+    volume.commit()
+    print("Done.")
+
+@app.local_entrypoint()
+def clean_meta():
+    nuke_meta_files.remote()
+
+@app.function(image=image, volumes={MOUNT: volume}, cpu=2, memory=4096)
+def rebuild_meta_from_mmaps(max_length: int = 80):
+    import numpy as np
+    import torch
+    import os
+    from pathlib import Path
+
+    cache_dir = f"{MOUNT}/cache"
+    
+    # find all mmap sets by looking for input_ids mmaps
+    mmap_files = sorted(Path(cache_dir).glob("*.input_ids.mmap"))
+    if not mmap_files:
+        print("No mmap files found!")
+        return
+
+    for mmap_file in mmap_files:
+        base = str(mmap_file).replace('.input_ids.mmap', '')
+        meta_file = base + '.meta.pt'
+        name = mmap_file.name.replace('.input_ids.mmap', '')
+
+        # infer n from file size — no need to load anything
+        file_bytes = mmap_file.stat().st_size
+        n = file_bytes // (max_length * 4)  # int32 = 4 bytes
+        
+        print(f"{name}: inferred n={n:,} from {file_bytes/1e9:.2f} GB mmap")
+
+        # sanity check — labels mmap should have same n
+        labels_file = base + '.labels.mmap'
+        d_labels_file = base + '.d_labels.mmap'
+        
+        has_labels_mmap = os.path.exists(labels_file) and os.path.exists(d_labels_file)
+
+        torch.save({
+            'n':             n,
+            'vocab_applied': has_labels_mmap,  # True only if label mmaps exist
+        }, meta_file)
+        
+        print(f"  Wrote minimal meta: n={n}, vocab_applied={has_labels_mmap}")
+
+    volume.commit()
+    print("\nDone. All meta files rebuilt.")
+
+@app.local_entrypoint()
+def rebuild_meta():
+    rebuild_meta_from_mmaps.remote()
 
 # ── Core training function (runs on Modal GPU) ─────────────────────────────────
 MAX_RETRIES = 10   # Modal preempts at most this many times before we give up
