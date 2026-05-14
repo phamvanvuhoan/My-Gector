@@ -1,22 +1,27 @@
 """
-modal_train.py — Three-stage GECToR training on Modal.
+modal_train.py — GECToR three-stage training on Modal.
 
-Requires data already uploaded via setup_volume_modal.py.
+Pipeline
+--------
+1. Upload raw data to the volume (done outside this file).
+2. Run preprocess_all once — CPU-heavy, no GPU needed.
+3. Run run_stage{1,2,3} — GPU training, resumes automatically after preemption.
 
-Usage:
+Usage
+-----
+    modal run modal_train.py::preprocess
     modal run modal_train.py::run_stage1
-    modal run modal_train.py::run_stage2 --model-id gotutiyan/gector-roberta-base-5k
+    modal run modal_train.py::run_stage2
     modal run modal_train.py::run_stage3
-
-Optional overrides (any stage):
-    modal run modal_train.py::run_stage1 --model-id bert-base-cased --batch-size 128
+    modal run modal_train.py::download_checkpoint --stage 3
 """
 
 import os
-import modal
 from pathlib import Path
 
-# ── Infrastructure ─────────────────────────────────────────────────────────────
+import modal
+
+# ── Infrastructure ────────────────────────────────────────────────────────────
 
 app    = modal.App("gector-train")
 volume = modal.Volume.from_name("gector-data", create_if_missing=False)
@@ -24,8 +29,8 @@ MOUNT  = "/gector-data"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .env({"FORCE_REBUILD": "2024-05-17"})
     .apt_install("git")
+    .env({"FORCE_REBUILD": "2024-05-17"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -35,612 +40,212 @@ image = (
         "wandb",
     )
     .run_commands(
-        #hope this help me rebuild image v1
         "pip install --no-cache-dir git+https://github.com/phamvanvuhoan/My-Gector.git"
     )
-    .add_local_file("train.py", "/root/train.py")   # <-- add this
+    .add_local_file("train.py", "/root/train.py")
 )
 
-GPU = "A10G"  # swap to A10G() for cheaper runs; A100 recommended for stage1
-
-# ── Shared paths inside the volume ────────────────────────────────────────────
+# ── Shared paths ──────────────────────────────────────────────────────────────
 
 DATA      = f"{MOUNT}/data"
 VOCAB_DIR = f"{DATA}/output_vocabulary"
+CACHE_DIR = f"{MOUNT}/cache"
 SAVE_BASE = f"{MOUNT}/checkpoints"
+HF_CACHE  = f"{MOUNT}/hf_cache"
 
+# Per-stage training configuration
 STAGE_CFG = {
     1: dict(
-        train_file  = f"{DATA}/stage1.train",
-        valid_file  = f"{DATA}/stage1.dev",
-        batch_size  = 512,
+        train_file    = f"{DATA}/stage1.train",
+        valid_file    = f"{DATA}/stage1.dev",
+        batch_size    = 512,
         n_cold_epochs = 2,
-        n_epochs    = 10,
-        save_dir    = f"{SAVE_BASE}/stage1",
+        n_epochs      = 10,
+        save_dir      = f"{SAVE_BASE}/stage1",
     ),
     2: dict(
-        train_file  = f"{DATA}/stage2.train",
-        valid_file  = f"{DATA}/stage2.dev",
-        batch_size  = 512,
+        train_file    = f"{DATA}/stage2.train",
+        valid_file    = f"{DATA}/stage2.dev",
+        batch_size    = 512,
         n_cold_epochs = 2,
-        n_epochs    = 10,
-        save_dir    = f"{SAVE_BASE}/stage2",
+        n_epochs      = 10,
+        save_dir      = f"{SAVE_BASE}/stage2",
     ),
     3: dict(
-        train_file  = f"{DATA}/stage3.train",
-        valid_file  = f"{DATA}/stage3.dev",
-        batch_size  = 512,
+        train_file    = f"{DATA}/stage3.train",
+        valid_file    = f"{DATA}/stage3.dev",
+        batch_size    = 512,
         n_cold_epochs = 0,
-        n_epochs    = 10,
-        save_dir    = f"{SAVE_BASE}/stage3",
+        n_epochs      = 10,
+        save_dir      = f"{SAVE_BASE}/stage3",
     ),
 }
 
-# add this to modal_train.py
+
+# ── Preprocessing (CPU) ───────────────────────────────────────────────────────
 
 @app.function(
     image   = image,
-    cpu     = 4,           # more CPUs = faster tokenization
-    memory  = 49152,       # 48 GB — stage1 is 8.8M sentences
+    cpu     = 8,
+    memory  = 49152,      # 48 GB — stage1 has 8.8M sentences
     volumes = {MOUNT: volume},
-    timeout = 7200,        # 2 hours should be enough for all stages
+    timeout = 14400,      # 4 hours
 )
 def preprocess_all(
-    model_id:   str = "roberta-base",
-    max_len:    int = 80,
+    model_id:  str = "roberta-base",
+    max_len:   int = 80,
 ):
     """
     Tokenize and cache all stage datasets on CPU.
-    Run this ONCE before any training stage.
+    Must be run once before any training stage.
 
-    Usage:
-        modal run modal_train.py::preprocess_all
-        modal run modal_train.py::preprocess_all --model-id bert-base-cased
+    For each input file this writes:
+        <cache>/<file>.cache_<hash>.input_ids.mmap
+        <cache>/<file>.cache_<hash>.attention_mask.mmap
+        <cache>/<file>.cache_<hash>.word_masks.mmap
+        <cache>/<file>.cache_<hash>.labels.mmap
+        <cache>/<file>.cache_<hash>.d_labels.mmap
+        <cache>/<file>.cache_<hash>.meta.pt
+
+    Resumes automatically after preemption via per-file progress files.
+    Files whose meta.pt already exists are skipped.
     """
     import os
     from transformers import AutoTokenizer
-    from gector import load_dataset, load_vocab_from_official
+    from gector.dataset import build_cache
+    from gector.vocab import load_vocab_from_official
 
-    def _save_label_mmaps(dataset, input_file, tokenizer, max_len, label2id, d_label2id):
-        """Write label tensors to mmap files and update meta to vocab_applied=True."""
-        from gector.dataset import _cache_path
-        import numpy as np
-        import torch
-
-        cache_file  = _cache_path(input_file, tokenizer, max_len)
-        labels_path   = cache_file + '.labels.mmap'
-        d_labels_path = cache_file + '.d_labels.mmap'
-        meta_file     = cache_file + '.meta.pt'
-        n = len(dataset)
-
-        labels_mm   = np.memmap(labels_path,   dtype='int64', mode='w+', shape=(n, max_len))
-        d_labels_mm = np.memmap(d_labels_path, dtype='int64', mode='w+', shape=(n, max_len))
-
-        # dataset.labels and d_labels are now tensors after append_vocab
-        labels_mm[:]   = dataset.labels.numpy().astype('int64')
-        d_labels_mm[:] = dataset.d_labels.numpy().astype('int64')
-
-        labels_mm.flush()
-        d_labels_mm.flush()
-
-        # update meta atomically
-        tmp = meta_file + '.tmp'
-        torch.save({'n': n, 'vocab_applied': True}, tmp)
-        os.replace(tmp, meta_file)
-        print(f"  Label mmaps saved: {labels_path}")
-
-    cache_dir = f"{MOUNT}/cache"
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ["GECTOR_CACHE_DIR"] = cache_dir
+    os.environ["GECTOR_CACHE_DIR"] = CACHE_DIR
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(HF_CACHE,  exist_ok=True)
+    os.environ["HF_HOME"] = HF_CACHE
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        add_prefix_space=True
+        model_id, add_prefix_space=True
     )
-    tokenizer.add_special_tokens(
-        {'additional_special_tokens': ['$START']}
-    )
+    tokenizer.add_special_tokens({"additional_special_tokens": ["$START"]})
 
-    # load vocab once — shared across all stages
-    label2id, d_label2id = load_vocab_from_official(f"{MOUNT}/data/output_vocabulary")
+    label2id, d_label2id = load_vocab_from_official(VOCAB_DIR)
 
-    stages = [
-        (f"{MOUNT}/data/stage1.train", "stage1 train"),
-        (f"{MOUNT}/data/stage1.dev",   "stage1 dev"),
-        (f"{MOUNT}/data/stage2.train", "stage2 train"),
-        (f"{MOUNT}/data/stage2.dev",   "stage2 dev"),
-        (f"{MOUNT}/data/stage3.train", "stage3 train"),
-        (f"{MOUNT}/data/stage3.dev",   "stage3 dev"),
+    files = [
+        f"{DATA}/stage1.train", f"{DATA}/stage1.dev",
+        f"{DATA}/stage2.train", f"{DATA}/stage2.dev",
+        f"{DATA}/stage3.train", f"{DATA}/stage3.dev",
     ]
 
-    for file_path, name in stages:
+    for file_path in files:
         if not os.path.exists(file_path):
-            print(f"SKIP {name}: file not found at {file_path}")
+            print(f"SKIP (not found): {file_path}")
             continue
 
-        print(f"\n{'='*50}")
-        print(f"Processing {name} ...")
-        print(f"{'='*50}")
+        print(f"\n{'='*60}")
+        print(f"Processing: {file_path}")
+        print(f"{'='*60}")
 
-        dataset =load_dataset(
-            input_file = file_path,
-            tokenizer  = tokenizer,
-            max_length = max_len,
-            use_cache  = True,
-            commit_fn  = lambda: volume.commit(),   # <-- add
+        build_cache(
+            input_file    = file_path,
+            tokenizer     = tokenizer,
+            label2id      = label2id,
+            d_label2id    = d_label2id,
+            max_length    = max_len,
+            commit_fn     = lambda: volume.commit(),
         )
-
-                # apply vocab → writes .labels.mmap and .d_labels.mmap
-        if not getattr(dataset, 'vocab_already_applied', False):
-            print(f"  Applying vocab for {name}...")
-            dataset.append_vocab(label2id, d_label2id)
-            # now persist label mmaps to volume
-            _save_label_mmaps(dataset, file_path, tokenizer, max_len, label2id, d_label2id)
-            volume.commit()
-            print(f"  ✓ Vocab applied and committed")
-        else:
-            print(f"  ✓ Vocab already applied, skipping")
-
-        # flush to volume after each file so partial progress is saved
-        # if this function gets interrupted
+        # Commit after each file so partial progress survives preemption.
         volume.commit()
-        print(f"✓ {name} cached and committed to volume")
 
-    print("\n✓ All preprocessing done. Ready to train.")
+    print("\n✓ All preprocessing complete.")
 
-@app.function(
-    image   = image,
-    cpu     = 8,
-    memory  = 65536,
-    volumes = {MOUNT: volume},
-    timeout = 3600,
-)
-def apply_vocab_to_cache(
+
+@app.local_entrypoint()
+def preprocess(
     model_id: str = "roberta-base",
     max_len:  int = 80,
 ):
-    """
-    One-time step: load existing cache meta files, apply vocab,
-    save back. After this, training skips append_vocab entirely.
-    """
-    import torch
-    import numpy as np
-    import gc
-    from pathlib import Path
-    from transformers import AutoTokenizer
-    from gector import load_vocab_from_official
-
-    cache_dir = f"{MOUNT}/cache"
-    label2id, d_label2id = load_vocab_from_official(
-        f"{MOUNT}/data/output_vocabulary"
-    )
-    oov_id   = label2id['<OOV>']
-    d_pad_id = d_label2id['<PAD>']
-
-    meta_files = sorted(Path(cache_dir).glob("*.meta.pt"))
-    if not meta_files:
-        print("No meta files found in cache dir")
-        return
-
-    for meta_file in meta_files:
-        print(f"\nProcessing {meta_file.name} ...")
-        meta = torch.load(str(meta_file), weights_only=False)
-
-        if meta.get('vocab_applied', False):
-            print("  Already applied, skipping")
-            continue
-
-        print(f"  Applying vocab to {meta['n']:,} sentences...")
-        labels   = meta['labels']
-        d_labels = meta['d_labels']
-
-        # convert string labels to ints
-        print("  Converting labels...")
-        labels_int = [
-            [label2id.get(l, oov_id) for l in sent]
-            for sent in labels
-        ]
-        print("  Converting d_labels...")
-        d_labels_int = [
-            [d_label2id.get(l, d_pad_id) for l in sent]
-            for sent in d_labels
-        ]
-
-        # overwrite meta file with vocab-applied labels
-        print("  Create new memmaps for vocab-applied labels...")
-        labels_mm = np.memmap(
-            cache_dir + '.labels.mmap',
-            dtype='int32', mode='w+', shape=(n, max_length)  # need max_length from meta
-        )
-        d_labels_mm = np.memmap(
-            cache_dir + '.d_labels.mmap', 
-            dtype='int32', mode='w+', shape=(n, max_length)
-        )
-
-        for i, (row, d_row) in enumerate(zip(labels_int, d_labels_int)):
-            arr = np.array(row, dtype='int32')
-            labels_mm[i, :len(arr)] = arr
-            # pad remainder already 0 from w+ mode
-
-        # save minimal meta — just n and flag
-        torch.save({'n': n, 'vocab_applied': True}, str(meta_file))
-
-        del labels, d_labels, labels_int, d_labels_int
-        gc.collect()
-
-        volume.commit()
-        print(f"  ✓ Done and committed")
-
-    print("\n✓ All cache files updated. Training will now skip append_vocab.")
+    preprocess_all.remote(model_id=model_id, max_len=max_len)
 
 
-@app.local_entrypoint()
-def apply_vocab():
-    apply_vocab_to_cache.spawn()
+# ── Training (GPU) ────────────────────────────────────────────────────────────
 
 @app.function(
     image   = image,
+    gpu     = "A10G",
     cpu     = 8,
-    memory  = 16384,    # low memory needed — converts chunk by chunk
+    memory  = 65536,
     volumes = {MOUNT: volume},
-    timeout = 3600,
-)
-def convert_mmap_to_int64():
-    """
-    One-time conversion of existing int32 mmap files to int64.
-    Much faster than reprocessing from scratch.
-    """
-    import numpy as np
-    from pathlib import Path
-
-    cache_dir = f"{MOUNT}/cache"
-    mmap_files = sorted(Path(cache_dir).glob("*.mmap"))
-
-    if not mmap_files:
-        print("No mmap files found")
-        return
-
-    for mmap_file in mmap_files:
-        print(f"\nConverting {mmap_file.name} ...")
-
-        # read shape from existing int32 file
-        old = np.memmap(str(mmap_file), dtype='int32', mode='r')
-        total_elements = old.shape[0]
-
-        # read meta to get (n, max_length) shape
-        # infer from file size: total_elements = n * max_length
-        # we know max_length=80 from training config
-        max_length = 80
-        n = total_elements // max_length
-        old = np.memmap(str(mmap_file), dtype='int32', mode='r', shape=(n, max_length))
-
-        size_gb = mmap_file.stat().st_size / 1e9
-        print(f"  Shape: ({n}, {max_length}), size: {size_gb:.2f} GB")
-
-        # write to temp file as int64
-        tmp_file = str(mmap_file) + '.int64.tmp'
-        new = np.memmap(tmp_file, dtype='int64', mode='w+', shape=(n, max_length))
-
-        # convert in chunks to avoid RAM spike
-        chunk = 50000
-        for i in range(0, n, chunk):
-            new[i:i+chunk] = old[i:i+chunk].astype('int64')
-            if i % 500000 == 0:
-                new.flush()
-                print(f"  {i}/{n} rows converted...")
-
-        new.flush()
-        del old, new
-
-        # replace original with converted file
-        import os, shutil
-        os.replace(tmp_file, str(mmap_file))
-        print(f"  ✓ Converted {mmap_file.name}")
-
-        volume.commit()
-
-    print("\n✓ All mmap files converted to int64")
-
-
-@app.local_entrypoint()
-def convert_cache():
-    convert_mmap_to_int64.spawn()
-
-# Verify cache integrity before training — run this to check for any issues with the cached files that could cause training to fail. This is especially useful if you had an interruption during preprocessing or if you want to sanity-check the cache before launching a long training run.
-@app.function(
-    image   = image,
-    cpu     = 4,
-    memory  = 16384,
-    volumes = {MOUNT: volume},
-    timeout = 600,
-)
-def verify_cache():
-    import numpy as np
-    import torch
-    import os
-    from pathlib import Path
-
-    cache_dir = f"{MOUNT}/cache"
-    issues    = []
-
-    cache_files = list(Path(cache_dir).glob("*.meta.pt"))
-    if not cache_files:
-        print("No cache files found!")
-        return
-
-    for meta_file in sorted(cache_files):
-        base = str(meta_file).replace('.meta.pt', '')
-        name = meta_file.name.replace('.meta.pt', '')
-        print(f"\nChecking {name} ...")
-
-        # 1. check all expected files exist
-        expected = [
-            meta_file,
-            base + '.input_ids.mmap',
-            base + '.attention_mask.mmap',
-            base + '.word_masks.mmap',
-        ]
-        for f in expected:
-            if not os.path.exists(f):
-                issues.append(f"MISSING FILE: {f}")
-                print(f"  ✗ Missing: {f}")
-            else:
-                size_gb = os.path.getsize(f) / 1e9
-                print(f"  ✓ Exists:  {f} ({size_gb:.2f} GB)")
-
-        # 2. load meta and check contents
-        try:
-            meta = torch.load(str(meta_file))
-            n         = meta['n']
-            n_labels  = len(meta['labels'])
-            n_dlabels = len(meta['d_labels'])
-            n_srcs    = len(meta['srcs'])
-            print(f"  n={n}, srcs={n_srcs}, labels={n_labels}, d_labels={n_dlabels}")
-
-            if not (n == n_labels == n_dlabels == n_srcs):
-                issues.append(
-                    f"SIZE MISMATCH in {name}: "
-                    f"n={n} srcs={n_srcs} labels={n_labels} d_labels={n_dlabels}"
-                )
-                print(f"  ✗ Size mismatch!")
-            else:
-                print(f"  ✓ Meta sizes consistent")
-        except Exception as e:
-            issues.append(f"META LOAD ERROR in {name}: {e}")
-            print(f"  ✗ Failed to load meta: {e}")
-            continue
-
-        # 3. check mmap shapes and spot-check values
-        try:
-            input_ids_mm = np.memmap(
-                base + '.input_ids.mmap',
-                dtype='int32', mode='r', shape=(n, 80)
-            )
-            attn_mm = np.memmap(
-                base + '.attention_mask.mmap',
-                dtype='int32', mode='r', shape=(n, 80)
-            )
-            wm_mm = np.memmap(
-                base + '.word_masks.mmap',
-                dtype='int32', mode='r', shape=(n, 80)
-            )
-
-            # check first, middle, last rows are not all zeros
-            for row_name, idx in [('first', 0), ('middle', n//2), ('last', n-1)]:
-                ids_row  = input_ids_mm[idx]
-                attn_row = attn_mm[idx]
-                if ids_row.sum() == 0:
-                    issues.append(f"ALL ZERO input_ids at row {idx} ({row_name}) in {name}")
-                    print(f"  ✗ All-zero input_ids at {row_name} row ({idx})")
-                elif attn_row.sum() == 0:
-                    issues.append(f"ALL ZERO attention_mask at row {idx} ({row_name}) in {name}")
-                    print(f"  ✗ All-zero attention_mask at {row_name} row ({idx})")
-                else:
-                    print(f"  ✓ {row_name} row looks valid (input_ids sum={ids_row.sum()})")
-
-            # check last batch specifically — most likely to be corrupted
-            print(f"  Checking last 1000 rows ...")
-            last_chunk = input_ids_mm[n-1000:n]
-            zero_rows  = (last_chunk.sum(axis=1) == 0).sum()
-            if zero_rows > 0:
-                issues.append(
-                    f"CORRUPT TAIL: {zero_rows} all-zero rows in last 1000 of {name}"
-                )
-                print(f"  ✗ {zero_rows} zero rows in last 1000 — likely corrupt from heartbeat failure")
-            else:
-                print(f"  ✓ Last 1000 rows look valid")
-
-        except Exception as e:
-            issues.append(f"MMAP ERROR in {name}: {e}")
-            print(f"  ✗ mmap failed: {e}")
-
-    # summary
-    print(f"\n{'='*50}")
-    if issues:
-        print(f"FOUND {len(issues)} ISSUE(S):")
-        for issue in issues:
-            print(f"  ✗ {issue}")
-        print("\nRecommendation: clear cache and rerun preprocess for affected files")
-    else:
-        print("✓ All cache files look valid. Safe to train.")
-
-
-@app.local_entrypoint()
-def verify():
-    verify_cache.remote()
-
-@app.function(image=image, volumes={MOUNT: volume}, cpu=2, memory=4096)
-def inspect_cache():
-    import os
-    from pathlib import Path
-    
-    cache_dir = f"{MOUNT}/cache"
-    for f in sorted(Path(cache_dir).glob("*.meta.pt")):
-        size_mb = f.stat().st_size / 1e6
-        print(f"{f.name}: {size_mb:.1f} MB")
-        
-        # Try to load with a timeout signal
-        import signal
-        def handler(sig, frame):
-            raise TimeoutError("torch.load hung")
-        signal.signal(signal.SIGALRM, handler)
-        signal.alarm(10)  # 10 second timeout
-        try:
-            import torch
-            meta = torch.load(str(f), weights_only=False)
-            signal.alarm(0)
-            print(f"  OK — n={meta.get('n')}, keys={list(meta.keys())}")
-        except TimeoutError:
-            print(f"  CORRUPT — torch.load hung after 10s, file is truncated")
-        except Exception as e:
-            print(f"  ERROR — {e}")
-
-@app.local_entrypoint()
-def check_meta():
-    inspect_cache.remote()
-
-@app.function(image=image, volumes={MOUNT: volume}, cpu=2, memory=512)
-def nuke_meta_files():
-    from pathlib import Path
-    cache_dir = f"{MOUNT}/cache"
-    for f in Path(cache_dir).glob("*.meta.pt"):
-        size_mb = f.stat().st_size / 1e6
-        print(f"Deleting {f.name} ({size_mb:.0f} MB)")
-        f.unlink()
-    # also delete any .tmp leftover from interrupted saves
-    for f in Path(cache_dir).glob("*.tmp"):
-        f.unlink()
-        print(f"Deleted tmp: {f.name}")
-    volume.commit()
-    print("Done.")
-
-@app.local_entrypoint()
-def clean_meta():
-    nuke_meta_files.remote()
-
-@app.function(image=image, volumes={MOUNT: volume}, cpu=2, memory=4096)
-def rebuild_meta_from_mmaps(max_length: int = 80):
-    import numpy as np
-    import torch
-    import os
-    from pathlib import Path
-
-    cache_dir = f"{MOUNT}/cache"
-    
-    # find all mmap sets by looking for input_ids mmaps
-    mmap_files = sorted(Path(cache_dir).glob("*.input_ids.mmap"))
-    if not mmap_files:
-        print("No mmap files found!")
-        return
-
-    for mmap_file in mmap_files:
-        base = str(mmap_file).replace('.input_ids.mmap', '')
-        meta_file = base + '.meta.pt'
-        name = mmap_file.name.replace('.input_ids.mmap', '')
-
-        # infer n from file size — no need to load anything
-        file_bytes = mmap_file.stat().st_size
-        n = file_bytes // (max_length * 4)  # int32 = 4 bytes
-        
-        print(f"{name}: inferred n={n:,} from {file_bytes/1e9:.2f} GB mmap")
-
-        # sanity check — labels mmap should have same n
-        labels_file = base + '.labels.mmap'
-        d_labels_file = base + '.d_labels.mmap'
-        
-        has_labels_mmap = os.path.exists(labels_file) and os.path.exists(d_labels_file)
-
-        torch.save({
-            'n':             n,
-            'vocab_applied': has_labels_mmap,  # True only if label mmaps exist
-        }, meta_file)
-        
-        print(f"  Wrote minimal meta: n={n}, vocab_applied={has_labels_mmap}")
-
-    volume.commit()
-    print("\nDone. All meta files rebuilt.")
-
-@app.local_entrypoint()
-def rebuild_meta():
-    rebuild_meta_from_mmaps.remote()
-
-# ── Core training function (runs on Modal GPU) ─────────────────────────────────
-MAX_RETRIES = 10   # Modal preempts at most this many times before we give up
-
-@app.function(
-    image   = image,
-    gpu     = GPU,
-    cpu     = 8,           # more CPUs = faster data loading
-    volumes = {MOUNT: volume},
-    timeout = 86400,   # 24 h — stage 1 can be long
-    secrets = [modal.Secret.from_name("wandb-secret")],   # <-- add
-    retries = modal.Retries(        # Modal-level retry on preemption/OOM
-        max_retries    = MAX_RETRIES,
+    timeout = 86400,   # 24 h
+    secrets = [modal.Secret.from_name("wandb-secret")],
+    retries = modal.Retries(
+        max_retries         = 10,
         backoff_coefficient = 1.0,
-        initial_delay  = 5.0,
+        initial_delay       = 5.0,
     ),
 )
 def train_stage(
-    stage:         int,
-    model_id:      str   = "roberta-base",
-    restore_dir:   str   = None,   # path inside volume, e.g. checkpoints/stage1/best
-    lr:            float = 1e-5,
-    cold_lr:       float = 1e-3,
-    max_len:       int   = 80,
-    n_max_labels:  int   = 5000,
-    accumulation:  int   = 1,
-    label_smoothing: float = 0.0,
-    num_warmup_steps: int = 500,
-    lr_scheduler_type: str = "constant",
-    seed:          int   = 10,
+    stage:             int,
+    model_id:          str   = "roberta-base",
+    restore_dir:       str   = None,
+    lr:                float = 1e-5,
+    cold_lr:           float = 1e-3,
+    max_len:           int   = 80,
+    n_max_labels:      int   = 5000,
+    accumulation:      int   = 1,
+    label_smoothing:   float = 0.0,
+    num_warmup_steps:  int   = 500,
+    lr_scheduler_type: str   = "constant",
+    seed:              int   = 10,
 ):
-    """Launches one training stage inside the Modal container."""
-    import subprocess, sys, json
+    """
+    Launch one training stage inside a Modal GPU container.
+    Resumes automatically from the latest step checkpoint after preemption.
+    Stage 2 and 3 default to restoring from the previous stage's best checkpoint.
+    """
+    import subprocess
+    import sys
 
-    # at the top of train_stage() in modal_train.py, before subprocess.run()
-    os.environ["HF_HOME"] = f"{MOUNT}/hf_cache"
-    os.makedirs(f"{MOUNT}/hf_cache", exist_ok=True)
+    os.environ["HF_HOME"]          = HF_CACHE
+    os.environ["GECTOR_CACHE_DIR"] = CACHE_DIR
 
-    cfg = STAGE_CFG[stage]
+    cfg      = STAGE_CFG[stage]
     save_dir = cfg["save_dir"]
     os.makedirs(save_dir, exist_ok=True)
 
-    # Stage 2/3: default to resuming from the previous stage's best checkpoint
+    # Default restore: previous stage's best checkpoint
     if restore_dir is None and stage > 1:
         prev_best = STAGE_CFG[stage - 1]["save_dir"] + "/best"
         if Path(prev_best).exists():
             restore_dir = prev_best
-            print(f"Stage {stage}: restoring from {restore_dir}")
+            print(f"Stage {stage}: restoring weights from {restore_dir}")
         else:
             print(
                 f"WARNING: expected checkpoint at {prev_best} but not found. "
-                "Training from scratch with --model-id."
+                "Training from scratch with --model_id."
             )
 
     cmd = [
         sys.executable, "-m", "accelerate.commands.launch",
         "--mixed_precision", "fp16",
-        # accelerate will auto-detect the single GPU
-        "train.py",                      # assumes train.py is importable via gector install
-        "--train_file",       cfg["train_file"],
-        "--valid_file",       cfg["valid_file"],
-        "--save_dir",         save_dir,
-        "--batch_size",       str(cfg["batch_size"]),
-        "--n_cold_epochs",    str(cfg["n_cold_epochs"]),
-        "--n_epochs",         str(cfg["n_epochs"]),
-        "--ckpt_steps",   "500",    # save every 500 steps
-        "--ckpt_limit", "2",    # keep last 2 only
-        "--resume_ckpt", "auto",  # always try to resume
-        "--lr",               str(lr),
-        "--cold_lr",          str(cold_lr),
-        "--max_len",          str(max_len),
-        "--n_max_labels",     str(n_max_labels),
-        "--accumulation",     str(accumulation),
-        "--label_smoothing",  str(label_smoothing),
-        "--num_warmup_steps", str(num_warmup_steps),
-        "--lr_scheduler_type", lr_scheduler_type,
-        "--seed",             str(seed),
+        "train.py",
+        "--train_file",          cfg["train_file"],
+        "--valid_file",          cfg["valid_file"],
+        "--save_dir",            save_dir,
+        "--batch_size",          str(cfg["batch_size"]),
+        "--n_cold_epochs",       str(cfg["n_cold_epochs"]),
+        "--n_epochs",            str(cfg["n_epochs"]),
+        "--lr",                  str(lr),
+        "--cold_lr",             str(cold_lr),
+        "--max_len",             str(max_len),
+        "--n_max_labels",        str(n_max_labels),
+        "--accumulation",        str(accumulation),
+        "--label_smoothing",     str(label_smoothing),
+        "--num_warmup_steps",    str(num_warmup_steps),
+        "--lr_scheduler_type",   lr_scheduler_type,
+        "--seed",                str(seed),
+        "--resume_ckpt",         "auto",
+        "--ckpt_steps",          "500",
+        "--ckpt_limit",          "2",
         "--restore_vocab_official", VOCAB_DIR,
+        "--wandb_project",       "gector",
+        "--wandb_run_name",      f"stage{stage}_{model_id}",
     ]
 
     if restore_dir:
@@ -648,125 +253,66 @@ def train_stage(
     else:
         cmd += ["--model_id", model_id]
 
-    cmd += [
-        "--wandb_project", "gector",
-        "--wandb_run_name", f"stage{stage}_{model_id}",
-    ]
-
     print(f"\n=== Stage {stage} command ===")
     print(" ".join(cmd))
-    print()
 
-    env = os.environ.copy()
-    env["HF_HOME"] = f"{MOUNT}/hf_cache"
+    subprocess.run(cmd, check=True, env=os.environ.copy())
 
-    result = subprocess.run(cmd, check=True, env=env)
-
-    # Commit volume writes so next stage / download can see them
     volume.commit()
-    print(f"\n✓ Stage {stage} complete. Checkpoints saved to {save_dir}")
+    print(f"\n✓ Stage {stage} complete. Checkpoints at {save_dir}")
     return save_dir
 
 
-# ── Per-stage entrypoints ──────────────────────────────────────────────────────
-
-@app.local_entrypoint()
-def preprocess(
-    model_id: str = "roberta-base",
-    max_len:  int = 80,
-):
-    preprocess_all.spawn(model_id=model_id, max_len=max_len)
-
-@app.local_entrypoint()
-def clear_cache():
-    import subprocess
-    clear.spawn()
-
-@app.function(image=image, volumes={MOUNT: volume})
-def clear():
-    import os
-
-    for root, dirs, files in os.walk(MOUNT):
-        for file in files:
-            if "cache" in file.lower():
-                path = os.path.join(root, file)
-
-                try:
-                    os.remove(path)
-                    print(f"Deleted {path}")
-                except Exception as e:
-                    print(f"Failed to delete {path}: {e}")
-
-    volume.commit()
-    print("✓ Cache cleared")
+# ── Per-stage entrypoints ─────────────────────────────────────────────────────
 
 @app.local_entrypoint()
 def run_stage1(
     model_id:   str   = "roberta-base",
-    batch_size: int   = 0,     # 0 = use default from STAGE_CFG
+    batch_size: int   = 0,
     lr:         float = 1e-5,
     seed:       int   = 10,
 ):
-    """Train stage 1 (large synthetic corpus, cold-start classifier)."""
+    """Train stage 1 (large synthetic corpus)."""
     _maybe_override_batch(1, batch_size)
-    save_dir = train_stage.spawn(
-        stage    = 1,
-        model_id = model_id,
-        lr       = lr,
-        seed     = seed,
-    )
-    print(f"Stage 1 done → {save_dir}")
+    train_stage.remote(stage=1, model_id=model_id, lr=lr, seed=seed)
 
 
 @app.local_entrypoint()
 def run_stage2(
-    restore_dir: str   = None,   # defaults to stage1/best
+    restore_dir: str   = None,
     batch_size:  int   = 0,
     lr:          float = 1e-5,
     seed:        int   = 10,
 ):
-    """Train stage 2 (BEA19 corpus, resume from stage 1)."""
+    """Train stage 2 (BEA19 corpus), resumes from stage 1 by default."""
     _maybe_override_batch(2, batch_size)
-    save_dir = train_stage.spawn(
-        stage       = 2,
-        restore_dir = restore_dir,
-        lr          = lr,
-        seed        = seed,
-    )
-    print(f"Stage 2 done → {save_dir}")
+    train_stage.remote(stage=2, restore_dir=restore_dir, lr=lr, seed=seed)
 
 
 @app.local_entrypoint()
 def run_stage3(
-    restore_dir: str   = None,   # defaults to stage2/best
+    restore_dir: str   = None,
     batch_size:  int   = 0,
     lr:          float = 1e-5,
     seed:        int   = 10,
 ):
-    """Train stage 3 (W&I+LOCNESS fine-tune, no cold epochs)."""
+    """Train stage 3 (W&I+LOCNESS fine-tune), resumes from stage 2 by default."""
     _maybe_override_batch(3, batch_size)
-    save_dir = train_stage.spawn(
-        stage       = 3,
-        restore_dir = restore_dir,
-        lr          = lr,
-        seed        = seed,
-    )
-    print(f"Stage 3 done → {save_dir}")
+    train_stage.remote(stage=3, restore_dir=restore_dir, lr=lr, seed=seed)
 
 
-# ── Download best checkpoint to local disk ────────────────────────────────────
+# ── Download ──────────────────────────────────────────────────────────────────
 
 @app.local_entrypoint()
 def download_checkpoint(
     stage:     int = 3,
-    which:     str = "best",   # "best" or "last"
+    which:     str = "best",
     local_dir: str = "outputs/modal_checkpoint",
 ):
     """
     Copy a trained checkpoint from the Modal Volume to your local machine.
 
-    Usage:
-        modal run modal_train.py::download_checkpoint --stage 3 --local-dir ./my_model
+        modal run modal_train.py::download_checkpoint --stage 3
     """
     remote = f"{SAVE_BASE}/stage{stage}/{which}"
     local  = Path(local_dir)
@@ -782,9 +328,8 @@ def download_checkpoint(
     print("✓ Download complete.")
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _maybe_override_batch(stage: int, batch_size: int):
-    """Allow CLI --batch-size to override the per-stage default."""
+def _maybe_override_batch(stage: int, batch_size: int) -> None:
     if batch_size > 0:
         STAGE_CFG[stage]["batch_size"] = batch_size
