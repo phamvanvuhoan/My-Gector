@@ -271,14 +271,24 @@ def main(args):
         model = GECToR.from_pretrained(args.restore_dir)
         label2id   = model.config.label2id
         d_label2id = model.config.d_label2id
+        
+        # Patch loss weight if override requested
+        if args.max_weight != 10.0:
+            new_weights = compute_class_weights(
+                train_dataset, label2id,
+                strategy  = "sqrt_inverse_freq",
+                max_weight = args.max_weight,
+            )
+            model.loss_fn = CrossEntropyLoss(
+                weight          = new_weights,
+                label_smoothing = model.config.label_smoothing,
+            )
+            model.config.label_weights = new_weights.tolist()
     else:
-        assert label2id is not None, \
-            "Provide --restore_vocab or --restore_vocab_official when not using --restore_dir"
-
         label_weights = compute_class_weights(
             train_dataset, label2id,
-            strategy="sqrt_inverse_freq",
-            max_weight=10.0,
+            strategy  = "sqrt_inverse_freq",
+            max_weight = args.max_weight,  # was hardcoded 10.0
         )
         config = GECToRConfig(
             model_id             = args.model_id,
@@ -455,6 +465,7 @@ def get_parser():
     # Logging
     p.add_argument("--wandb_project",         default=None)
     p.add_argument("--wandb_run_name",        default=None)
+    p.add_argument("--max_weight", type=float, default=10.0)
     return p.parse_args()
 
 

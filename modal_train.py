@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-17"})
+    .env({"FORCE_REBUILD": "2024-05-18"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -183,7 +183,8 @@ def preprocess(
 def train_stage(
     stage:             int,
     model_id:          str   = "roberta-base",
-    restore_dir:       str   = None,
+    restore_dir:       str   = None, # change to f"{SAVE_BASE}/stage1/last" if want to change max_weight at the beginning of epoch
+    max_weight:         float = 3.0,
     lr:                float = 1e-5,
     cold_lr:           float = 1e-3,
     max_len:           int   = 80,
@@ -246,6 +247,7 @@ def train_stage(
         "--restore_vocab_official", VOCAB_DIR,
         "--wandb_project",       "gector",
         "--wandb_run_name",      f"stage{stage}_{model_id}",
+        "--max_weight",          str(max_weight),
     ]
 
     if restore_dir:
