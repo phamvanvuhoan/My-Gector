@@ -266,7 +266,7 @@ def load_dataset(
 
     # ── Helper: infer n from mmap file size ───────────────────────────────────
     def infer_n_from_mmap(path, max_length):
-        return os.path.getsize(path) // (max_length * 4)  # int32 = 4 bytes
+        return os.path.getsize(path) // (max_length * 8)  # int32 = 4 bytes
 
     # ── Helper: load minimal meta, rebuild if fat/corrupt ────────────────────
     def load_or_rebuild_meta():
@@ -342,11 +342,11 @@ def load_dataset(
             print(f"✓ Cache hit: {cache_file} (n={n:,})")
 
             input_ids_mm      = np.memmap(input_ids_path,
-                                           dtype='int32', mode='r', shape=(n, max_length))
+                                           dtype='int64', mode='r', shape=(n, max_length))
             attention_mask_mm = np.memmap(attention_mask_path,
-                                           dtype='int32', mode='r', shape=(n, max_length))
+                                           dtype='int64', mode='r', shape=(n, max_length))
             word_masks_mm     = np.memmap(word_masks_path,
-                                           dtype='int32', mode='r', shape=(n, max_length))
+                                           dtype='int64', mode='r', shape=(n, max_length))
 
             # ── Apply vocab to label mmaps if not done yet ────────────────
             if not vocab_applied:
@@ -395,9 +395,9 @@ def load_dataset(
 
             # ── Happy path: label mmaps exist ────────────────────────────
             labels_mm   = np.memmap(labels_path,
-                                     dtype='int32', mode='r', shape=(n, max_length))
+                                     dtype='int64', mode='r', shape=(n, max_length))
             d_labels_mm = np.memmap(d_labels_path,
-                                     dtype='int32', mode='r', shape=(n, max_length))
+                                     dtype='int64', mode='r', shape=(n, max_length))
 
             dataset = GECToRDataset(
                 srcs            = None,

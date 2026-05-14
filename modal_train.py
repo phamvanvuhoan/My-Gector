@@ -16,8 +16,6 @@ import os
 import modal
 from pathlib import Path
 
-from gector.vocab import load_vocab_from_official
-
 # ── Infrastructure ─────────────────────────────────────────────────────────────
 
 app    = modal.App("gector-train")
@@ -101,7 +99,7 @@ def preprocess_all(
     """
     import os
     from transformers import AutoTokenizer
-    from gector import load_dataset
+    from gector import load_dataset, load_vocab_from_official
 
     def _save_label_mmaps(dataset, input_file, tokenizer, max_len, label2id, d_label2id):
         """Write label tensors to mmap files and update meta to vocab_applied=True."""
@@ -115,12 +113,12 @@ def preprocess_all(
         meta_file     = cache_file + '.meta.pt'
         n = len(dataset)
 
-        labels_mm   = np.memmap(labels_path,   dtype='int32', mode='w+', shape=(n, max_len))
-        d_labels_mm = np.memmap(d_labels_path, dtype='int32', mode='w+', shape=(n, max_len))
+        labels_mm   = np.memmap(labels_path,   dtype='int64', mode='w+', shape=(n, max_len))
+        d_labels_mm = np.memmap(d_labels_path, dtype='int64', mode='w+', shape=(n, max_len))
 
         # dataset.labels and d_labels are now tensors after append_vocab
-        labels_mm[:]   = dataset.labels.numpy().astype('int32')
-        d_labels_mm[:] = dataset.d_labels.numpy().astype('int32')
+        labels_mm[:]   = dataset.labels.numpy().astype('int64')
+        d_labels_mm[:] = dataset.d_labels.numpy().astype('int64')
 
         labels_mm.flush()
         d_labels_mm.flush()
