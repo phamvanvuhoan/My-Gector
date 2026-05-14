@@ -90,20 +90,13 @@ def main(args):
             batch_size=args.batch_size,
             length_penalty=args.length_penalty
         )
-    else:
-        final_corrected_sents = predict(**predict_args)
-
-    if args.visualize is not None:
-        final_corrected_sents, iteration_log = predict_verbose(
-            **predict_args
-        )
+    elif args.visualize is not None:
+        final_corrected_sents, iteration_log = predict_verbose(**predict_args)
         strs = visualizer(iteration_log)
         with open(args.visualize, 'w') as fp:
             fp.write(strs)
     else:
-        final_corrected_sents = predict(
-            **predict_args
-        )
+        final_corrected_sents = predict(**predict_args)
     with open(args.out, 'w') as f:
         f.write('\n'.join(final_corrected_sents))
 

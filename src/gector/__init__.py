@@ -1,6 +1,6 @@
 from .modeling import GECToR
 from .configuration import GECToRConfig
-from .dataset import load_dataset, GECToRDataset
+from .dataset import load_dataset, GECToRDataset, SkipDataset
 from .predict import predict, load_verb_dict
 from .predict_verbose import predict_verbose
 from .vocab import (
@@ -21,4 +21,5 @@ __all__ = [
     'load_vocab_from_config',
     'load_vocab_from_official',
     'beam_predict'
+    'SkipDataset'
 ]

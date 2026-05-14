@@ -161,7 +161,7 @@ def preprocess(
     model_id: str = "roberta-base",
     max_len:  int = 80,
 ):
-    preprocess_all.remote(model_id=model_id, max_len=max_len)
+    preprocess_all.spawn(model_id=model_id, max_len=max_len)
 
 
 # ── Training (GPU) ────────────────────────────────────────────────────────────
@@ -274,7 +274,7 @@ def run_stage1(
 ):
     """Train stage 1 (large synthetic corpus)."""
     _maybe_override_batch(1, batch_size)
-    train_stage.remote(stage=1, model_id=model_id, lr=lr, seed=seed)
+    train_stage.spawn(stage=1, model_id=model_id, lr=lr, seed=seed)
 
 
 @app.local_entrypoint()
@@ -286,7 +286,7 @@ def run_stage2(
 ):
     """Train stage 2 (BEA19 corpus), resumes from stage 1 by default."""
     _maybe_override_batch(2, batch_size)
-    train_stage.remote(stage=2, restore_dir=restore_dir, lr=lr, seed=seed)
+    train_stage.spawn(stage=2, restore_dir=restore_dir, lr=lr, seed=seed)
 
 
 @app.local_entrypoint()
@@ -298,7 +298,7 @@ def run_stage3(
 ):
     """Train stage 3 (W&I+LOCNESS fine-tune), resumes from stage 2 by default."""
     _maybe_override_batch(3, batch_size)
-    train_stage.remote(stage=3, restore_dir=restore_dir, lr=lr, seed=seed)
+    train_stage.spawn(stage=3, restore_dir=restore_dir, lr=lr, seed=seed)
 
 
 # ── Download ──────────────────────────────────────────────────────────────────

@@ -24,6 +24,7 @@ from transformers import AutoTokenizer, get_scheduler
 
 from gector import (
     GECToR,
+    SkipDataset,
     GECToRConfig,
     load_dataset,
     load_vocab_from_config,
@@ -104,7 +105,6 @@ def train_epoch(
     ckpt_limit:   int,
     save_dir:     str,
     use_accumulate: bool,
-    resume_step:  int = 0,
 ):
     log = {"loss": 0.0, "accuracy": 0.0, "accuracy_d": 0.0}
     n_batches = 0
@@ -113,8 +113,6 @@ def train_epoch(
                 disable=not accelerator.is_main_process)
 
     for step, batch in enumerate(pbar):
-        if step < resume_step:
-            continue
 
         if use_accumulate:
             with accelerator.accumulate(model):
@@ -200,6 +198,28 @@ def main(args):
     )
     use_accumulate = args.accumulation > 1
 
+    # ── Resume state (needed before datasets, scheduler, everything) ─────────
+    global_step  = 0
+    resume_epoch = 0
+    resume_step  = 0
+
+    resume_path = args.resume_ckpt
+    if resume_path == "auto":
+        ckpt_dirs = sorted(
+            [d for d in Path(args.save_dir).glob("checkpoint_*") if d.is_dir()],
+            key=os.path.getmtime,
+        )
+        resume_path = str(ckpt_dirs[-1]) if ckpt_dirs else None
+        print(f"Auto-resume: {resume_path or 'no checkpoint found, starting fresh'}")
+
+    if resume_path and Path(resume_path).exists():
+        try:
+            global_step  = int(Path(resume_path).name.split("_")[-1])
+            # steps_per_ep is unknown here — we compute it after datasets load.
+            # Store resume_path and resolve epoch/step after dataset is ready.
+        except ValueError:
+            resume_path = None  # malformed checkpoint name, treat as fresh start
+
     if accelerator.is_main_process and args.wandb_project:
         wandb.init(
             project = args.wandb_project,
@@ -228,8 +248,23 @@ def main(args):
     # ── Datasets ─────────────────────────────────────────────────────────────
     print("Loading datasets ...")
     train_dataset = load_dataset(args.train_file, tokenizer, args.max_len)
+    # Now we can resolve epoch/step because we know steps_per_ep
+    steps_per_ep = (len(train_dataset) + args.batch_size - 1) // args.batch_size
+    if global_step > 0:
+        resume_epoch = global_step // steps_per_ep
+        resume_step  = global_step  % steps_per_ep
+        print(f"Resumed: global_step={global_step}, "
+              f"epoch={resume_epoch}, step_in_epoch={resume_step}")
+    # If we're resuming mid-epoch, skip already-seen samples
+    skip_n = resume_step * args.batch_size  # batches → samples
+    if skip_n > 0 and skip_n < len(train_dataset):
+        print(f"Resuming mid-epoch: skipping first {skip_n:,} samples ({resume_step} batches)")
+        resumed_train_dataset = SkipDataset(train_dataset, skip_n)
+    else:
+        resumed_train_dataset = train_dataset
+
     valid_dataset = load_dataset(args.valid_file, tokenizer, args.max_len)
-    print(f"  train: {len(train_dataset):,}  valid: {len(valid_dataset):,}")
+    print(f"  train: {len(resumed_train_dataset):,}  valid: {len(valid_dataset):,}")
 
     # ── Model ────────────────────────────────────────────────────────────────
     if args.restore_dir is not None:
@@ -260,9 +295,9 @@ def main(args):
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
     train_loader = _make_dataloader(
-        train_dataset,
+        resumed_train_dataset,
         batch_size  = args.batch_size,
-        shuffle     = True,
+        shuffle     = skip_n == 0,  # only shuffle if not resuming mid-epoch
         num_workers = 8,
         prefetch    = 4,
     )
@@ -276,46 +311,28 @@ def main(args):
 
     # ── Optimizer & scheduler ────────────────────────────────────────────────
     optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr)
+    warm_epochs = max(0, args.n_epochs - max(args.n_cold_epochs, resume_epoch))
+    num_training_steps = len(train_loader) * warm_epochs // args.accumulation
+    remaining_warmup   = max(0, args.num_warmup_steps - global_step)
+
     lr_scheduler = get_scheduler(
         name               = args.lr_scheduler_type,
         optimizer          = optimizer,
-        num_warmup_steps   = args.num_warmup_steps * args.accumulation,
-        num_training_steps = (
-            len(train_loader)
-            * (args.n_epochs - args.n_cold_epochs)
-            // args.accumulation
-        ),
+        num_warmup_steps   = remaining_warmup * args.accumulation,
+        num_training_steps = num_training_steps,
     )
-
     model, optimizer, train_loader, valid_loader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_loader, valid_loader, lr_scheduler
     )
 
-    # ── Resume ───────────────────────────────────────────────────────────────
-    global_step  = 0
-    resume_epoch = 0
-    resume_step  = 0
-
-    resume_path = args.resume_ckpt
-    if resume_path == "auto":
-        ckpt_dirs = sorted(
-            [d for d in Path(args.save_dir).glob("checkpoint_*") if d.is_dir()],
-            key=os.path.getmtime,
-        )
-        resume_path = str(ckpt_dirs[-1]) if ckpt_dirs else None
-        print(f"Auto-resume: {resume_path or 'no checkpoint found, starting fresh'}")
-
+    # ── Load checkpoint weights/optimizer state AFTER prepare ────────────────
     if resume_path and Path(resume_path).exists():
         accelerator.load_state(resume_path)
-        try:
-            global_step  = int(Path(resume_path).name.split("_")[-1])
-            steps_per_ep = len(train_loader)
-            resume_epoch = global_step // steps_per_ep
-            resume_step  = global_step  % steps_per_ep
-            print(f"Resumed: global_step={global_step}, "
-                  f"epoch={resume_epoch}, step_in_epoch={resume_step}")
-        except ValueError:
-            pass
+        # Scheduler fast-forward — pure arithmetic, very fast
+        if resume_step > 0 and resume_epoch >= args.n_cold_epochs:
+            print(f"Fast-forwarding LR scheduler by {resume_step} steps ...")
+            for _ in range(resume_step):
+                lr_scheduler.step()
 
     # ── Output dirs ───────────────────────────────────────────────────────────
     path_best = os.path.join(args.save_dir, "best")
@@ -344,9 +361,14 @@ def main(args):
         elif epoch == args.n_cold_epochs:
             module.tune_bert(True)
             _set_lr(optimizer, args.lr)
-            step_scheduler = True
         else:
-            step_scheduler = True
+            # Resuming into a warm epoch — ensure bert is unfrozen and LR is correct
+            module.tune_bert(True)
+            # Don't override LR here if scheduler already loaded it from checkpoint;
+            # only fix if it looks like cold_lr leaked through
+            if optimizer.param_groups[0]['lr'] == args.cold_lr:
+                _set_lr(optimizer, args.lr)
+            step_scheduler = True   # ← add this to enable scheduler stepping in train_epoch
 
         print(f"=== Epoch {epoch} ===")
         train_log, global_step = train_epoch(
@@ -358,7 +380,6 @@ def main(args):
             ckpt_limit     = args.ckpt_limit,
             save_dir       = args.save_dir,
             use_accumulate = use_accumulate,
-            resume_step    = resume_step if epoch == resume_epoch else 0,
         )
         valid_log = valid_epoch(model, valid_loader, accelerator, epoch)
 
