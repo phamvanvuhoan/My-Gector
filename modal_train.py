@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-18"})
+    .env({"FORCE_REBUILD": "2024-05-19"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -66,7 +66,7 @@ STAGE_CFG = {
     2: dict(
         train_file    = f"{DATA}/stage2.train",
         valid_file    = f"{DATA}/stage2.dev",
-        batch_size    = 512,
+        batch_size    = 256,
         n_cold_epochs = 2,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage2",
@@ -74,7 +74,7 @@ STAGE_CFG = {
     3: dict(
         train_file    = f"{DATA}/stage3.train",
         valid_file    = f"{DATA}/stage3.dev",
-        batch_size    = 512,
+        batch_size    = 128,
         n_cold_epochs = 0,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage3",
@@ -168,9 +168,9 @@ def preprocess(
 
 @app.function(
     image   = image,
-    gpu     = "A10G",
-    cpu     = 8,
-    memory  = 65536,
+    gpu     = "A100-40GB",
+    cpu     = 4,
+    memory  = 16384,
     volumes = {MOUNT: volume},
     timeout = 86400,   # 24 h
     secrets = [modal.Secret.from_name("wandb-secret")],
@@ -184,15 +184,15 @@ def train_stage(
     stage:             int,
     model_id:          str   = "roberta-base",
     restore_dir:       str   = None, # change to f"{SAVE_BASE}/stage1/last" if want to change max_weight at the beginning of epoch
-    max_weight:         float = 3.0,
+    max_weight:        float = 3.0,
     lr:                float = 1e-5,
     cold_lr:           float = 1e-3,
     max_len:           int   = 80,
     n_max_labels:      int   = 5000,
     accumulation:      int   = 1,
-    label_smoothing:   float = 0.0,
+    label_smoothing:   float = 0.1,
     num_warmup_steps:  int   = 500,
-    lr_scheduler_type: str   = "constant",
+    lr_scheduler_type: str   = "cosine",
     seed:              int   = 10,
 ):
     """
@@ -283,7 +283,7 @@ def run_stage1(
 def run_stage2(
     restore_dir: str   = None,
     batch_size:  int   = 0,
-    lr:          float = 1e-5,
+    lr:          float = 5e-6,
     seed:        int   = 10,
 ):
     """Train stage 2 (BEA19 corpus), resumes from stage 1 by default."""
@@ -295,7 +295,7 @@ def run_stage2(
 def run_stage3(
     restore_dir: str   = None,
     batch_size:  int   = 0,
-    lr:          float = 1e-5,
+    lr:          float = 5e-6,
     seed:        int   = 10,
 ):
     """Train stage 3 (W&I+LOCNESS fine-tune), resumes from stage 2 by default."""

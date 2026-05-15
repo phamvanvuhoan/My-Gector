@@ -259,9 +259,7 @@ def main(args):
     skip_n = min(resume_step * args.batch_size, len(train_dataset) - 1)  # batches → samples
     if skip_n > 0 and skip_n < len(train_dataset):
         print(f"Resuming mid-epoch: skipping first {skip_n:,} samples ({resume_step} batches)")
-        resumed_train_dataset = SkipDataset(train_dataset, skip_n)
-    else:
-        resumed_train_dataset = train_dataset
+    resumed_train_dataset = SkipDataset(train_dataset, skip_n)
 
     valid_dataset = load_dataset(args.valid_file, tokenizer, args.max_len)
     print(f"  train: {len(resumed_train_dataset):,}  valid: {len(valid_dataset):,}")
@@ -382,6 +380,9 @@ def main(args):
             step_scheduler = True   # ← add this to enable scheduler stepping in train_epoch
 
         print(f"=== Epoch {epoch} ===")
+        if epoch > resume_epoch and isinstance(resumed_train_dataset, SkipDataset):
+            resumed_train_dataset.reset()
+
         train_log, global_step = train_epoch(
             model, train_loader, optimizer, lr_scheduler, accelerator,
             epoch          = epoch,

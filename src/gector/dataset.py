@@ -92,22 +92,29 @@ class GECToRDataset:
 
 class SkipDataset(torch.utils.data.Dataset):
     """
-    Zero-copy view of a GECToRDataset that skips the first `skip_n` items.
-    Used to resume mid-epoch without iterating discarded batches.
-    The underlying mmap is shared — no data is copied.
+    Stateful view of a GECToRDataset that skips the first `skip_n` items
+    for the first epoch, then resets to full dataset for subsequent epochs.
     """
     def __init__(self, dataset: GECToRDataset, skip_n: int):
         assert 0 <= skip_n < len(dataset), \
             f"skip_n={skip_n} out of range for dataset of length {len(dataset)}"
         self._dataset = dataset
         self._skip_n  = skip_n
+        self._resumed = False   # False = still in resumed epoch
+
+    def reset(self):
+        """Call at the start of each new epoch after the resumed one."""
+        self._resumed = True
 
     def __len__(self) -> int:
-        return len(self._dataset) - self._skip_n
+        if self._resumed:
+            return len(self._dataset)          # full dataset
+        return len(self._dataset) - self._skip_n  # skipped
 
     def __getitem__(self, idx: int):
-        return self._dataset[idx + self._skip_n]
-
+        if self._resumed:
+            return self._dataset[idx]          # full dataset, no offset
+        return self._dataset[idx + self._skip_n]  # skipped
 # ── Loader (training path) ────────────────────────────────────────────────────
 
 def load_dataset(
