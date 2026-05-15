@@ -1,0 +1,149 @@
+
+<style>
+.section { margin-bottom: 28px; }
+.section-title { font-size: 14px; font-weight: 500; color: var(--color-text-primary); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+.badge { font-size: 11px; font-weight: 500; padding: 2px 8px; border-radius: 20px; }
+.badge-crit { background: #FCEBEB; color: #A32D2D; }
+.badge-warn { background: #FAEEDA; color: #854F0B; }
+.badge-info { background: #E6F1FB; color: #185FA5; }
+.issue { padding: 10px 14px; border-radius: 8px; margin-bottom: 8px; border-left: 3px solid transparent; font-size: 13px; }
+.issue-crit { background: var(--color-background-secondary); border-left-color: #E24B4A; }
+.issue-warn  { background: var(--color-background-secondary); border-left-color: #EF9F27; }
+.issue-info  { background: var(--color-background-secondary); border-left-color: #378ADD; }
+.issue-title { font-weight: 500; color: var(--color-text-primary); margin-bottom: 3px; }
+.issue-loc  { font-size: 11px; color: var(--color-text-tertiary); font-family: var(--font-mono); margin-bottom: 5px; }
+.issue-body { color: var(--color-text-secondary); line-height: 1.6; }
+code { font-family: var(--font-mono); font-size: 12px; background: var(--color-background-tertiary); padding: 1px 5px; border-radius: 4px; color: var(--color-text-primary); }
+</style>
+
+<div class="section">
+  <div class="section-title"><span class="badge badge-crit">Critical bugs</span></div>
+
+  <div class="issue issue-crit">
+    <div class="issue-title">Variable shadowing in <code>_predict()</code> inner loop</div>
+    <div class="issue-loc">src/gector/predict.py — _predict(), line ~50</div>
+    <div class="issue-body">
+      The outer loop variable <code>i</code> (iterating over batches: <code>for i in itr</code>) is re-used as the inner loop variable <code>for i in range(len(outputs.pred_labels))</code>. After the inner loop completes, <code>i</code> holds the last inner index (e.g. 127 for batch_size=128), so the <em>next</em> batch starts at <code>srcs[128:256]</code> — which happens to be correct only for batch_size=128. For any other batch size, slicing is off. Rename the inner variable to <code>j</code>.
+    </div>
+  </div>
+
+  <div class="issue issue-crit">
+    <div class="issue-title"><code>d_labels</code> masking overwrites labels, not d_labels</div>
+    <div class="issue-loc">src/gector/modeling.py — forward(), ~line 110</div>
+    <div class="issue-body">
+      <code>d_labels[labels == -100] = -100</code> is set <em>after</em> <code>labels[labels == pad_id] = -100</code>, which is correct. But immediately before the detection loss, there's no guard: if a pad position is only in <code>d_labels</code> (e.g. due to a length mismatch), those positions propagate into the detection loss. This is a subtle masking inconsistency that silently inflates <code>loss_d</code> on pad tokens.
+    </div>
+  </div>
+
+  <div class="issue issue-crit">
+    <div class="issue-title">Loss weight tensor device mismatch on multi-GPU</div>
+    <div class="issue-loc">src/gector/modeling.py — forward(), ~line 116</div>
+    <div class="issue-body">
+      The fix <code>self.loss_fn.weight = self.loss_fn.weight.to(logits_labels.device)</code> is done inside <code>forward()</code> on every single call. This is both inefficient and not thread-safe under DDP — each process copies the tensor to its own device, but mutates the shared <code>loss_fn</code> object in place. The weight should be moved once during model initialization or in <code>to(device)</code>, not patched every forward pass.
+    </div>
+  </div>
+
+  <div class="issue issue-crit">
+    <div class="issue-title">LR scheduler built on incorrect <code>warm_epochs</code></div>
+    <div class="issue-loc">train.py — main(), ~line 175</div>
+    <div class="issue-body">
+      <code>warm_epochs = max(0, args.n_epochs - max(args.n_cold_epochs, resume_epoch))</code> uses <code>resume_epoch</code> at construction time, but if the job resumes mid-training (e.g. epoch 0 of a 10-epoch run), this shrinks <code>num_training_steps</code> relative to what the original run used. The scheduler sees fewer total steps and miscalibrates its decay, causing the LR to drop faster than intended on cosine schedules. The scheduler should always be built for the <em>full</em> warm steps regardless of resume position.
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title"><span class="badge badge-warn">Logic / correctness warnings</span></div>
+
+  <div class="issue issue-warn">
+    <div class="issue-title"><code>shuffle=False</code> when resuming kills data randomness</div>
+    <div class="issue-loc">train.py — _make_dataloader(), ~line 205</div>
+    <div class="issue-body">
+      <code>shuffle = skip_n == 0</code> means any resumed epoch trains on a deterministic, ordered slice of the dataset. This biases gradient updates toward examples that happen to appear late in the file order, typically harder or domain-specific examples. A better approach: shuffle with a seeded generator and fast-forward by <code>skip_n</code> steps, or just always shuffle and accept a small overlap on resume.
+    </div>
+  </div>
+
+  <div class="issue issue-warn">
+    <div class="issue-title"><code>SkipDataset.reset()</code> is called a step too late</div>
+    <div class="issue-loc">train.py — training loop, ~line 248</div>
+    <div class="issue-body">
+      <code>resumed_train_dataset.reset()</code> is called at the top of the epoch loop with condition <code>if epoch > resume_epoch</code>. Since <code>train_loader</code> wraps the dataset and was created before the loop, the DataLoader's sampler already saw the initial (possibly skipped) length at construction. Calling <code>reset()</code> mid-run changes <code>__len__</code> but doesn't rebuild the sampler, so the epoch after resume still draws from the skip-adjusted view.
+    </div>
+  </div>
+
+  <div class="issue issue-warn">
+    <div class="issue-title">Scheduler fast-forward only runs if <code>resume_step &gt; 0</code></div>
+    <div class="issue-loc">train.py — ~line 234</div>
+    <div class="issue-body">
+      If a checkpoint was saved exactly at the end of an epoch (<code>resume_step == 0</code>), the scheduler is never fast-forwarded even though <code>resume_epoch * steps_per_ep</code> steps have already been taken. The condition should be <code>if global_step &gt; 0</code>, not <code>if resume_step &gt; 0</code>.
+    </div>
+  </div>
+
+  <div class="issue issue-warn">
+    <div class="issue-title">Class weight computation runs over <code>train_dataset</code>, not <code>resumed_train_dataset</code></div>
+    <div class="issue-loc">train.py — ~line 155</div>
+    <div class="issue-body">
+      <code>compute_class_weights(train_dataset, ...)</code> is called on the full unsliced dataset, which is correct for computing representative weights. However, this is also a very slow pass over potentially 8M rows that re-runs on <em>every preemption restart</em>. The weights should be cached to disk alongside the vocab so restarts skip it entirely.
+    </div>
+  </div>
+
+  <div class="issue issue-warn">
+    <div class="issue-title">Beam search applies <code>no_correction_ids</code> as a list, not a set</div>
+    <div class="issue-loc">src/gector/beam_predict.py — _score_hypotheses(), ~line 40</div>
+    <div class="issue-body">
+      <code>no_correction_ids</code> is built as a <code>set</code> in <code>beam_predict()</code> but passed to <code>_score_hypotheses()</code> as <code>list(no_correction_ids)</code>, then checked with <code>in no_correction_ids</code> inside the function which receives a list. The membership test is O(n) instead of O(1). With thousands of label positions this is measurable. Pass the set directly or keep it as a set inside the helper.
+    </div>
+  </div>
+
+  <div class="issue issue-warn">
+    <div class="issue-title"><code>word_masks</code> passed but not used in beam's <code>_score_hypotheses</code></div>
+    <div class="issue-loc">src/gector/beam_predict.py — ~line 75</div>
+    <div class="issue-body">
+      The function computes <code>word_masks</code> via <code>get_word_masks_from_word_ids</code> and then uses <code>wm</code> for the max error probability gate. But the <code>word_positions</code> list is built from <code>wm[j].item() == 1</code> inside a list comprehension that also checks <code>if batch.get('attention_mask', None) is not None</code> — a condition that is always true since the batch always has an attention mask. This dead branch adds confusion without filtering anything.
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title"><span class="badge badge-info">Design / robustness notes</span></div>
+
+  <div class="issue issue-info">
+    <div class="issue-title"><code>preprocess_all</code> does not commit after each file on failure</div>
+    <div class="issue-loc">modal_train.py — preprocess_all()</div>
+    <div class="issue-body">
+      <code>volume.commit()</code> is called after each file's <code>build_cache()</code> returns, but only if <code>build_cache</code> itself doesn't raise. If tokenization crashes mid-file (OOM, malformed line), no commit happens and the partial mmap is lost on preemption. The <code>build_cache</code> internal 5-batch commits survive, but the Modal volume state won't reflect them until the next successful commit call.
+    </div>
+  </div>
+
+  <div class="issue issue-info">
+    <div class="issue-title"><code>has_args_add_pooling</code> instantiates the full model just to inspect a signature</div>
+    <div class="issue-loc">src/gector/utils.py</div>
+    <div class="issue-body">
+      <code>AutoModel.from_config(...).__class__.__init__</code> calls <code>AutoModel.from_config</code> which instantiates (on CPU) the entire transformer just to read its <code>__init__</code> signature. This wastes several seconds and allocates a large temporary model. Use <code>inspect.signature(AutoModel._model_type_to_module[...] or AutoConfig)</code> or simply hard-code the list of models that do/don't support <code>add_pooling_layer</code>.
+    </div>
+  </div>
+
+  <div class="issue issue-info">
+    <div class="issue-title"><code>vocab.py</code>'s <code>build_vocab</code> calls non-existent <code>get_labels_freq()</code></div>
+    <div class="issue-loc">src/gector/vocab.py — build_vocab()</div>
+    <div class="issue-body">
+      <code>train_dataset.get_labels_freq(...)</code> is called but <code>GECToRDataset</code> has no such method. This function will crash at runtime if ever called. It appears to be a leftover from an older dataset API. Either implement the method or remove <code>build_vocab</code> since the codebase exclusively uses <code>load_vocab_from_official</code> in practice.
+    </div>
+  </div>
+
+  <div class="issue issue-info">
+    <div class="issue-title">No gradient clipping anywhere in the training loop</div>
+    <div class="issue-loc">train.py — train_epoch()</div>
+    <div class="issue-body">
+      The optimizer step has no <code>clip_grad_norm_</code> call. For large RoBERTa/XLNet models fine-tuned on noisy GEC data, gradient explosions are common during warm-up. The original GECToR paper and most transformer fine-tuning recipes clip at 1.0. Add <code>accelerator.clip_grad_norm_(model.parameters(), 1.0)</code> before <code>optimizer.step()</code>.
+    </div>
+  </div>
+
+  <div class="issue issue-info">
+    <div class="issue-title">Cold epoch LR override can fight loaded checkpoint LR</div>
+    <div class="issue-loc">train.py — training loop, ~line 245</div>
+    <div class="issue-body">
+      When resuming into a warm epoch, the code checks <code>if optimizer.param_groups[0]['lr'] == args.cold_lr</code> to decide whether to reset LR. But <code>accelerator.load_state</code> restores the optimizer state (including LR) from the checkpoint. If the last checkpoint happened to be saved during a cold epoch of a previous run, this heuristic silently leaves the wrong LR in place. The phase (cold/warm) should be derived from epoch index alone, not from the optimizer state.
+    </div>
+  </div>
+</div>

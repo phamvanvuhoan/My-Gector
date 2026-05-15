@@ -153,16 +153,16 @@ def _predict(
             min_error_prob
         )
         # Align subword-level label to word-level label
-        for i in range(len(outputs.pred_labels)):
+        for j in range(len(outputs.pred_labels)):
             no_correct = True
             labels = []
             previous_word_idx = None
-            for j, idx in enumerate(word_ids(i)):
+            for k, idx in enumerate(word_ids(j)):
                 if idx is None:
                     continue
                 if idx != previous_word_idx:
-                    labels.append(outputs.pred_labels[i][j])
-                    if outputs.pred_label_ids[i][j] not in no_correction_ids:
+                    labels.append(outputs.pred_labels[j][k])
+                    if outputs.pred_label_ids[j][k] not in no_correction_ids:
                         no_correct = False
                 previous_word_idx = idx
             pred_labels.append(labels)

@@ -3,6 +3,10 @@ train.py
 
 Single-GPU or multi-GPU training via Accelerate.
 Expects all datasets to be fully preprocessed (run preprocess_all on Modal first).
+
+- fix this: LR scheduler built on incorrect warm_epochs
+- SkipDataset.reset() is called a step too late
+- shuffle=False when resuming kills data randomness
 """
 
 import argparse
@@ -337,7 +341,7 @@ def main(args):
     if resume_path and Path(resume_path).exists():
         accelerator.load_state(resume_path)
         # Scheduler fast-forward — pure arithmetic, very fast
-        if resume_step > 0 and resume_epoch >= args.n_cold_epochs:
+        if global_step > 0 and resume_epoch >= args.n_cold_epochs:
             print(f"Fast-forwarding LR scheduler by {resume_step} steps ...")
             for _ in range(resume_step):
                 lr_scheduler.step()
