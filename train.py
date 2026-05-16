@@ -312,7 +312,7 @@ def main(args):
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
     current_batch_size = (
-        args.batch_size if epoch < args.n_cold_epochs
+        args.batch_size if resume_epoch < args.n_cold_epochs
         else args.warm_batch_size
     )
     train_loader = _make_dataloader(
