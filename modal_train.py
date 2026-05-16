@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-22"})
+    .env({"FORCE_REBUILD": "2024-05-23"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -58,7 +58,8 @@ STAGE_CFG = {
     1: dict(
         train_file    = f"{DATA}/stage1.train",
         valid_file    = f"{DATA}/stage1.dev",
-        batch_size    = 1048,
+        batch_size    = 1048,   # cold epochs
+        warm_batch_size = 512,   # warm epochs
         n_cold_epochs = 2,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage1",
@@ -246,7 +247,7 @@ def train_stage(
         "--ckpt_limit",          "2",
         "--restore_vocab_official", VOCAB_DIR,
         "--wandb_project",       "gector",
-        "--wandb_run_name",      f"stage{stage}_{model_id}",
+        "--wandb_run_name",      f"stage{stage}_{model_id}_v2",
         "--max_weight",          str(max_weight),
     ]
 

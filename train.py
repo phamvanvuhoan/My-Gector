@@ -311,9 +311,13 @@ def main(args):
         model = GECToR(config=config)
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
+    current_batch_size = (
+        args.batch_size if epoch < args.n_cold_epochs
+        else args.warm_batch_size
+    )
     train_loader = _make_dataloader(
         resumed_train_dataset,
-        batch_size  = args.batch_size,
+        batch_size  = current_batch_size,
         shuffle     = skip_n == 0,  # only shuffle if not resuming mid-epoch
         num_workers = 4,
         prefetch    = 8,
@@ -406,12 +410,18 @@ def main(args):
         valid_log = valid_epoch(model, valid_loader, accelerator, epoch)
 
         # Rebuild to full dataset once, after the resumed epoch finishes
-        if needs_loader_rebuild:
+        if needs_loader_rebuild or epoch == args.n_cold_epochs:
             del train_loader
+            if args.warm_batch_size == 0:
+                args.warm_batch_size = args.batch_size
+            current_batch_size = (
+                args.batch_size if epoch < args.n_cold_epochs
+                else args.warm_batch_size
+            )
             train_loader = accelerator.prepare(
                 _make_dataloader(
                     train_dataset,
-                    batch_size  = args.batch_size,
+                    batch_size  = current_batch_size,
                     shuffle     = True,
                     num_workers = 4,
                     prefetch    = 8,
@@ -491,6 +501,8 @@ def get_parser():
     p.add_argument("--wandb_project",         default=None)
     p.add_argument("--wandb_run_name",        default=None)
     p.add_argument("--max_weight", type=float, default=10.0)
+    p.add_argument("--warm_batch_size", type=int, default=0,
+        help="Batch size for warm epochs. 0 = same as --batch_size")
     return p.parse_args()
 
 
