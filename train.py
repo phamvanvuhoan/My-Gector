@@ -329,7 +329,7 @@ def main(args):
     # ── Optimizer & scheduler ────────────────────────────────────────────────
     optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr)
     warm_epochs = max(0, args.n_epochs - max(args.n_cold_epochs, resume_epoch))
-    num_training_steps = len(train_loader) * warm_epochs // args.accumulation
+    num_training_steps = steps_per_ep * warm_epochs // args.accumulation
     remaining_warmup   = max(0, args.num_warmup_steps - global_step)
 
     lr_scheduler = get_scheduler(
@@ -347,8 +347,11 @@ def main(args):
         accelerator.load_state(resume_path)
         # Scheduler fast-forward — pure arithmetic, very fast
         if global_step > 0 and resume_epoch >= args.n_cold_epochs:
-            print(f"Fast-forwarding LR scheduler by {resume_step} steps ...")
-            for _ in range(resume_step):
+            warm_steps_done = (
+                (resume_epoch - args.n_cold_epochs) * steps_per_ep + resume_step
+            )
+            print(f"Fast-forwarding LR scheduler by {warm_steps_done} steps ...")
+            for _ in range(warm_steps_done):
                 lr_scheduler.step()
 
     # ── Output dirs ───────────────────────────────────────────────────────────
@@ -360,6 +363,7 @@ def main(args):
     tokenizer.save_pretrained(path_last)
 
     # ── Training loop ────────────────────────────────────────────────────────
+    needs_loader_rebuild = skip_n > 0
     max_acc = -1.0
     logs    = {"args": vars(args)}
     print("Starting training ...")
@@ -389,15 +393,6 @@ def main(args):
             step_scheduler = True   # ← add this to enable scheduler stepping in train_epoch
 
         print(f"=== Epoch {epoch} ===")
-        if not(epoch == resume_epoch and skip_n > 0):
-            train_loader = _make_dataloader(
-                train_dataset,
-                batch_size  = args.batch_size,
-                shuffle     = True,
-                num_workers = 4,
-                prefetch    = 8,
-            )
-
         train_log, global_step = train_epoch(
             model, train_loader, optimizer, lr_scheduler, accelerator,
             epoch          = epoch,
@@ -409,6 +404,20 @@ def main(args):
             use_accumulate = use_accumulate,
         )
         valid_log = valid_epoch(model, valid_loader, accelerator, epoch)
+
+        # Rebuild to full dataset once, after the resumed epoch finishes
+        if needs_loader_rebuild:
+            del train_loader
+            train_loader = accelerator.prepare(
+                _make_dataloader(
+                    train_dataset,
+                    batch_size  = args.batch_size,
+                    shuffle     = True,
+                    num_workers = 4,
+                    prefetch    = 8,
+                )
+            )
+            needs_loader_rebuild = False
 
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
