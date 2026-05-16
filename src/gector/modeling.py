@@ -127,6 +127,7 @@ class GECToR(PreTrainedModel):
         bert_logits = self.bert(
             input_ids,
             attention_mask=attention_mask,
+            token_type_ids   = torch.zeros_like(input_ids),  # ← add this
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
