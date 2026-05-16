@@ -311,6 +311,8 @@ def main(args):
         model = GECToR(config=config)
 
     # ── DataLoaders ──────────────────────────────────────────────────────────
+    if args.warm_batch_size == 0:
+        args.warm_batch_size = args.batch_size
     current_batch_size = (
         args.batch_size if resume_epoch < args.n_cold_epochs
         else args.warm_batch_size
@@ -410,12 +412,12 @@ def main(args):
         valid_log = valid_epoch(model, valid_loader, accelerator, epoch)
 
         # Rebuild to full dataset once, after the resumed epoch finishes
-        if needs_loader_rebuild or epoch == args.n_cold_epochs:
+        if needs_loader_rebuild or epoch == args.n_cold_epochs-1:
             del train_loader
             if args.warm_batch_size == 0:
                 args.warm_batch_size = args.batch_size
             current_batch_size = (
-                args.batch_size if epoch < args.n_cold_epochs
+                args.batch_size if epoch < args.n_cold_epochs-1
                 else args.warm_batch_size
             )
             train_loader = accelerator.prepare(
