@@ -195,6 +195,9 @@ def main(args):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
+    if torch.cuda.get_device_name(0) == "NVIDIA A100-SXM4-40GB":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32       = True
 
     accelerator    = Accelerator(
         gradient_accumulation_steps=args.accumulation,
@@ -310,15 +313,15 @@ def main(args):
         resumed_train_dataset,
         batch_size  = args.batch_size,
         shuffle     = skip_n == 0,  # only shuffle if not resuming mid-epoch
-        num_workers = 8,
-        prefetch    = 4,
+        num_workers = 4,
+        prefetch    = 8,
     )
     valid_loader = _make_dataloader(
         valid_dataset,
         batch_size  = args.batch_size,
         shuffle     = False,
         num_workers = 4,
-        prefetch    = 4,
+        prefetch    = 8,
     )
 
     # ── Optimizer & scheduler ────────────────────────────────────────────────
@@ -384,8 +387,14 @@ def main(args):
             step_scheduler = True   # ← add this to enable scheduler stepping in train_epoch
 
         print(f"=== Epoch {epoch} ===")
-        if epoch > resume_epoch and isinstance(resumed_train_dataset, SkipDataset):
-            resumed_train_dataset.reset()
+        if not(epoch == resume_epoch and skip_n > 0):
+            train_loader = _make_dataloader(
+                train_dataset,
+                batch_size  = args.batch_size,
+                shuffle     = True,
+                num_workers = 4,
+                prefetch    = 8,
+            )
 
         train_log, global_step = train_epoch(
             model, train_loader, optimizer, lr_scheduler, accelerator,

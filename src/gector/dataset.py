@@ -100,20 +100,11 @@ class SkipDataset(torch.utils.data.Dataset):
             f"skip_n={skip_n} out of range for dataset of length {len(dataset)}"
         self._dataset = dataset
         self._skip_n  = skip_n
-        self._resumed = False   # False = still in resumed epoch
-
-    def reset(self):
-        """Call at the start of each new epoch after the resumed one."""
-        self._resumed = True
 
     def __len__(self) -> int:
-        if self._resumed:
-            return len(self._dataset)          # full dataset
         return len(self._dataset) - self._skip_n  # skipped
 
     def __getitem__(self, idx: int):
-        if self._resumed:
-            return self._dataset[idx]          # full dataset, no offset
         return self._dataset[idx + self._skip_n]  # skipped
 # ── Loader (training path) ────────────────────────────────────────────────────
 

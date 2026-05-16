@@ -58,7 +58,7 @@ STAGE_CFG = {
     1: dict(
         train_file    = f"{DATA}/stage1.train",
         valid_file    = f"{DATA}/stage1.dev",
-        batch_size    = 512,
+        batch_size    = 1048,
         n_cold_epochs = 2,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage1",
@@ -66,7 +66,7 @@ STAGE_CFG = {
     2: dict(
         train_file    = f"{DATA}/stage2.train",
         valid_file    = f"{DATA}/stage2.dev",
-        batch_size    = 256,
+        batch_size    = 728,
         n_cold_epochs = 2,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage2",
@@ -74,7 +74,7 @@ STAGE_CFG = {
     3: dict(
         train_file    = f"{DATA}/stage3.train",
         valid_file    = f"{DATA}/stage3.dev",
-        batch_size    = 128,
+        batch_size    = 516,
         n_cold_epochs = 0,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage3",
@@ -224,7 +224,7 @@ def train_stage(
 
     cmd = [
         sys.executable, "-m", "accelerate.commands.launch",
-        "--mixed_precision", "fp16",
+        "--mixed_precision", "bf16", # A100s support bf16, which is faster and has higher effective batch size than fp16 (change back to "fp16" if using other GPUs)
         "train.py",
         "--train_file",          cfg["train_file"],
         "--valid_file",          cfg["valid_file"],
@@ -271,12 +271,13 @@ def train_stage(
 def run_stage1(
     model_id:   str   = "roberta-base",
     batch_size: int   = 0,
-    lr:         float = 1e-5,
+    lr:         float = 2e-5,
+    num_warmup_steps: int = 1000,
     seed:       int   = 10,
 ):
     """Train stage 1 (large synthetic corpus)."""
     _maybe_override_batch(1, batch_size)
-    train_stage.spawn(stage=1, model_id=model_id, lr=lr, seed=seed)
+    train_stage.spawn(stage=1, model_id=model_id, lr=lr, num_warmup_steps=num_warmup_steps, seed=seed)
 
 
 @app.local_entrypoint()
