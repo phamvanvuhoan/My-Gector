@@ -124,6 +124,7 @@ def train_epoch(
                 loss    = outputs.loss
                 optimizer.zero_grad()
                 accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.parameters(), 1.0)  # ← add here
                 optimizer.step()
                 if step_scheduler:
                     lr_scheduler.step()
@@ -132,6 +133,7 @@ def train_epoch(
             loss    = outputs.loss
             optimizer.zero_grad()
             accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)  # ← add here
             optimizer.step()
 
         global_step += 1
