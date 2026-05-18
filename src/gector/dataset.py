@@ -43,6 +43,9 @@ def _cache_path(input_file: str, tokenizer: PreTrainedTokenizer, max_length: int
 
     tok_name = model_id or tokenizer.name_or_path
     key = f"{input_file}_{tok_name}_{max_length}_{MMAP_DTYPE}"
+    h = hashlib.md5(key.encode()).hexdigest()[:8]
+    filename = os.path.basename(input_file)
+    return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
