@@ -42,9 +42,9 @@ def _cache_path(input_file: str, tokenizer: PreTrainedTokenizer, max_length: int
     # return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
 
     if input_file.endswith("stage3.train"):
-        return os.path.join(CACHE_DIR, "stage3.train.cache_1a4340b4")
+        return os.path.join(CACHE_DIR, "stage3.train.cache_09a71b50")
     elif input_file.endswith("stage3.dev"):
-        return os.path.join(CACHE_DIR, "stage3.dev.cache_b10723e7")
+        return os.path.join(CACHE_DIR, "stage3.dev.cache_2ffef4d6")
     return None
 
 
