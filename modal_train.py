@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-31"})
+    .env({"FORCE_REBUILD": "2024-05-33"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -68,16 +68,16 @@ STAGE_CFG = {
         train_file    = f"{DATA}/stage2.train",
         valid_file    = f"{DATA}/stage2.dev",
         batch_size    = 512,
-        warm_batch_size = 512,   # warm epochs
-        n_cold_epochs = 2,
+        warm_batch_size = 256,   # warm epochs
+        n_cold_epochs = 1,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage2",
     ),
     3: dict(
         train_file    = f"{DATA}/stage3.train",
         valid_file    = f"{DATA}/stage3.dev",
-        batch_size    = 512,
-        warm_batch_size = 0,   # warm epochs
+        batch_size    = 256,
+        warm_batch_size = 128,   # warm epochs
         n_cold_epochs = 0,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage3",
@@ -193,9 +193,9 @@ def train_stage(
     max_len:           int   = 80,
     n_max_labels:      int   = 5000,
     accumulation:      int   = 1,
-    label_smoothing:   float = 0.1,
-    num_warmup_steps:  int   = 500,
-    lr_scheduler_type: str   = "cosine",
+    label_smoothing:   float = 0.0,
+    num_warmup_steps:  int   = 200,
+    lr_scheduler_type: str   = "constant",
     seed:              int   = 10,
 ):
     """
@@ -227,7 +227,7 @@ def train_stage(
 
     cmd = [
         sys.executable, "-m", "accelerate.commands.launch",
-        "--mixed_precision", "bf16", # A100s support bf16, which is faster and has higher effective batch size than fp16 (change back to "fp16" if using other GPUs)
+        "--mixed_precision", "fp16", # A100s support bf16, which is faster and has higher effective batch size than fp16 (change back to "fp16" if using other GPUs)
         "train.py",
         "--train_file",          cfg["train_file"],
         "--valid_file",          cfg["valid_file"],
@@ -250,7 +250,7 @@ def train_stage(
         "--ckpt_limit",          "2",
         "--restore_vocab_official", VOCAB_DIR,
         "--wandb_project",       "gector",
-        "--wandb_run_name",      f"stage{stage}_{model_id}",
+        "--wandb_run_name",      f"stage{stage}_{model_id}_v2",
         "--max_weight",          str(max_weight),
     ]
 
@@ -288,12 +288,13 @@ def run_stage1(
 def run_stage2(
     restore_dir: str   = None,
     batch_size:  int   = 0,
-    lr:          float = 5e-6,
+    lr:          float = 1e-5,
+    num_warmup_steps: int = 200,
     seed:        int   = 10,
 ):
     """Train stage 2 (BEA19 corpus), resumes from stage 1 by default."""
     _maybe_override_batch(2, batch_size)
-    train_stage.spawn(stage=2, restore_dir=restore_dir, lr=lr, seed=seed)
+    train_stage.spawn(stage=2, restore_dir=restore_dir, lr=lr, num_warmup_steps=num_warmup_steps, seed=seed)
 
 
 @app.local_entrypoint()
@@ -301,11 +302,12 @@ def run_stage3(
     restore_dir: str   = None,
     batch_size:  int   = 0,
     lr:          float = 5e-6,
+    num_warmup_steps: int = 100,
     seed:        int   = 10,
 ):
     """Train stage 3 (W&I+LOCNESS fine-tune), resumes from stage 2 by default."""
     _maybe_override_batch(3, batch_size)
-    train_stage.spawn(stage=3, restore_dir=restore_dir, lr=lr, seed=seed)
+    train_stage.spawn(stage=3, restore_dir=restore_dir, lr=lr, num_warmup_steps=num_warmup_steps, seed=seed)
 
 
 # ── Download ──────────────────────────────────────────────────────────────────
