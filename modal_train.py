@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-30"})
+    .env({"FORCE_REBUILD": "2024-05-31"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -178,7 +178,7 @@ def preprocess(
     timeout = 86400,   # 24 h
     secrets = [modal.Secret.from_name("wandb-secret")],
     retries = modal.Retries(
-        max_retries         = 10,
+        max_retries         = 2,
         backoff_coefficient = 1.0,
         initial_delay       = 5.0,
     ),

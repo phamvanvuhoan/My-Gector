@@ -39,15 +39,24 @@ class GECToR(PreTrainedModel):
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_id
         )
+        
+        # if self.config.has_add_pooling_layer:
+        #     self.bert = AutoModel.from_pretrained(
+        #         self.config.model_id,
+        #         add_pooling_layer=False
+        #     )
+        # else:
+        #     self.bert = AutoModel.from_pretrained(
+        #         self.config.model_id
+        #     )
+        bert_config = AutoConfig.from_pretrained(self.config.model_id)
         if self.config.has_add_pooling_layer:
-            self.bert = AutoModel.from_pretrained(
-                self.config.model_id,
+            self.bert = AutoModel.from_config(
+                bert_config,
                 add_pooling_layer=False
             )
         else:
-            self.bert = AutoModel.from_pretrained(
-                self.config.model_id
-            )
+            self.bert = AutoModel.from_config(bert_config)
 
         # Build weighted loss; falls back to uniform if no weights given
         if config.label_weights is not None:
