@@ -256,7 +256,7 @@ def main(args):
 
     # ── Datasets ─────────────────────────────────────────────────────────────
     print("Loading datasets ...")
-    train_dataset = load_dataset(args.train_file, tokenizer, args.max_len)
+    train_dataset = load_dataset(args.train_file, tokenizer, args.max_len, model_id = args.model_id)
     # Now we can resolve epoch/step because we know steps_per_ep
     steps_per_ep = (len(train_dataset) + args.batch_size - 1) // args.batch_size
     if global_step > 0:

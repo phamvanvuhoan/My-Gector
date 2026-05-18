@@ -33,7 +33,7 @@ MMAP_DTYPE = "int32"
 
 # ── Cache path ────────────────────────────────────────────────────────────────
 
-def _cache_path(input_file: str, tokenizer: PreTrainedTokenizer, max_length: int) -> str:
+def _cache_path(input_file: str, tokenizer: PreTrainedTokenizer, max_length: int, model_id: str = None) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     # Include dtype in the hash so old int64 caches are never silently reused.
     # key = f"{input_file}_{tokenizer.name_or_path}_{max_length}_{MMAP_DTYPE}"
@@ -41,18 +41,8 @@ def _cache_path(input_file: str, tokenizer: PreTrainedTokenizer, max_length: int
     # filename = os.path.basename(input_file)
     # return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
 
-    tok_name = tokenizer.name_or_path
-    if os.path.isdir(tok_name):
-        # Local checkpoint path — read original model name from saved config
-        import json
-        config_path = os.path.join(tok_name, "tokenizer_config.json")
-        with open(config_path) as f:
-            tok_name = json.load(f).get("name_or_path", tok_name)
-
+    tok_name = model_id or tokenizer.name_or_path
     key = f"{input_file}_{tok_name}_{max_length}_{MMAP_DTYPE}"
-    h   = hashlib.md5(key.encode()).hexdigest()[:8]
-    filename = os.path.basename(input_file)
-    return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -125,12 +115,13 @@ def load_dataset(
     input_file: str,
     tokenizer:  PreTrainedTokenizer,
     max_length: int = 128,
+    model_id: str = None,
 ) -> GECToRDataset:
     """
     Load a fully pre-processed dataset from cache.
     Raises FileNotFoundError if preprocessing has not been run yet.
     """
-    cache_file = _cache_path(input_file, tokenizer, max_length)
+    cache_file = _cache_path(input_file, tokenizer, max_length, model_id)
 
     required = {
         "input_ids":      cache_file + ".input_ids.mmap",
