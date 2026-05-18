@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-25"})
+    .env({"FORCE_REBUILD": "2024-05-27"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -67,7 +67,8 @@ STAGE_CFG = {
     2: dict(
         train_file    = f"{DATA}/stage2.train",
         valid_file    = f"{DATA}/stage2.dev",
-        batch_size    = 728,
+        batch_size    = 512,
+        warm_batch_size = 512,   # warm epochs
         n_cold_epochs = 2,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage2",
@@ -75,7 +76,8 @@ STAGE_CFG = {
     3: dict(
         train_file    = f"{DATA}/stage3.train",
         valid_file    = f"{DATA}/stage3.dev",
-        batch_size    = 516,
+        batch_size    = 512,
+        warm_batch_size = 0,   # warm epochs
         n_cold_epochs = 0,
         n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage3",
@@ -169,7 +171,7 @@ def preprocess(
 
 @app.function(
     image   = image,
-    gpu     = "A100-40GB",
+    gpu     = "A10G",
     cpu     = 4,
     memory  = 16384,
     volumes = {MOUNT: volume},
@@ -231,6 +233,7 @@ def train_stage(
         "--valid_file",          cfg["valid_file"],
         "--save_dir",            save_dir,
         "--batch_size",          str(cfg["batch_size"]),
+        "--warm_batch_size",     str(cfg["warm_batch_size"]),
         "--n_cold_epochs",       str(cfg["n_cold_epochs"]),
         "--n_epochs",            str(cfg["n_epochs"]),
         "--lr",                  str(lr),
@@ -247,7 +250,7 @@ def train_stage(
         "--ckpt_limit",          "2",
         "--restore_vocab_official", VOCAB_DIR,
         "--wandb_project",       "gector",
-        "--wandb_run_name",      f"stage{stage}_{model_id}_v2",
+        "--wandb_run_name",      f"stage{stage}_{model_id}",
         "--max_weight",          str(max_weight),
     ]
 
@@ -272,7 +275,7 @@ def train_stage(
 def run_stage1(
     model_id:   str   = "roberta-base",
     batch_size: int   = 0,
-    lr:         float = 2e-5,
+    lr:         float = 1e-5,
     num_warmup_steps: int = 1000,
     seed:       int   = 10,
 ):

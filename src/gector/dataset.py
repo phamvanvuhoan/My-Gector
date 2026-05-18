@@ -36,8 +36,21 @@ MMAP_DTYPE = "int32"
 def _cache_path(input_file: str, tokenizer: PreTrainedTokenizer, max_length: int) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     # Include dtype in the hash so old int64 caches are never silently reused.
-    key = f"{input_file}_{tokenizer.name_or_path}_{max_length}_{MMAP_DTYPE}"
-    h = hashlib.md5(key.encode()).hexdigest()[:8]
+    # key = f"{input_file}_{tokenizer.name_or_path}_{max_length}_{MMAP_DTYPE}"
+    # h = hashlib.md5(key.encode()).hexdigest()[:8]
+    # filename = os.path.basename(input_file)
+    # return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
+
+    tok_name = tokenizer.name_or_path
+    if os.path.isdir(tok_name):
+        # Local checkpoint path — read original model name from saved config
+        import json
+        config_path = os.path.join(tok_name, "tokenizer_config.json")
+        with open(config_path) as f:
+            tok_name = json.load(f).get("name_or_path", tok_name)
+
+    key = f"{input_file}_{tok_name}_{max_length}_{MMAP_DTYPE}"
+    h   = hashlib.md5(key.encode()).hexdigest()[:8]
     filename = os.path.basename(input_file)
     return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
 
