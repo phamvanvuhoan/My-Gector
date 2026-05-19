@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-34"})
+    .env({"FORCE_REBUILD": "2024-05-35"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -272,38 +272,21 @@ def train_stage(
 @app.function(
     image=image,
     gpu="T4",
-    cpu=2,
-    memory=4096,
+    cpu=4,
+    memory=8192,
     volumes={MOUNT: volume},
     timeout=180,
 )
 def test():
-    from transformers import AutoTokenizer
-    from gector import GECToR, predict, load_verb_dict
-    import torch
+    from gector import GECToR
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/best").eval()
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/best")
-    encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage1/best")
 
-    if torch.cuda.is_available():
-        model.cuda()
-
-    srcs = [
-        "This are wrong sentences",
-        "He go to school yesterday",
-        "I have went to the store",
-    ]
-    corrected = predict(
-        model, tokenizer, srcs, encode, decode,
-        keep_confidence = 0.0,
-        min_error_prob  = 0.0,
-        n_iteration     = 5,
-    )
-    for src, cor in zip(srcs, corrected):
-        print(f"SRC: {src}")
-        print(f"COR: {cor}")
-        print()
+    # Check IMMEDIATELY, nothing else in between
+    w = model.label_proj_layer.weight
+    print(f"std right after from_pretrained: {w.std().item():.6f}")
+    print(f"label_proj_layer std: {model.label_proj_layer.weight.std().item():.6f}")
+    print(f"requires_grad: {w.requires_grad}")
 
 # ── Per-stage entrypoints ─────────────────────────────────────────────────────
 

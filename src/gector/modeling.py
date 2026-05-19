@@ -97,6 +97,34 @@ class GECToR(PreTrainedModel):
         self.post_init()
         self.tune_bert(False)
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        import safetensors.torch as st
+        import os
+
+        # Load normally first
+        model = super().from_pretrained(
+            pretrained_model_name_or_path, *args, **kwargs
+        )
+
+        # Explicitly reload classifier weights which post_init() may have overwritten
+        weights_path = os.path.join(
+            pretrained_model_name_or_path, "model.safetensors"
+        )
+        if os.path.exists(weights_path):
+            saved = st.load_file(weights_path)
+            for key in ["label_proj_layer.weight", "label_proj_layer.bias",
+                        "d_proj_layer.weight",     "d_proj_layer.bias"]:
+                if key in saved:
+                    param = model
+                    for attr in key.split("."):
+                        param = getattr(param, attr)
+                    param.data.copy_(saved[key])
+            print(f"✓ Classifier weights reloaded explicitly")
+            print(f"  label_proj_layer std: {model.label_proj_layer.weight.std().item():.6f}")
+
+        return model
+
     def init_weight(self) -> None:
         self._init_weights(self.label_proj_layer)
         self._init_weights(self.d_proj_layer)
