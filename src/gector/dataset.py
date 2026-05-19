@@ -35,17 +35,11 @@ MMAP_DTYPE = "int32"
 
 def _cache_path(input_file: str, tokenizer: PreTrainedTokenizer, max_length: int, model_id: str = None) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
-    # Include dtype in the hash so old int64 caches are never silently reused.
-    # key = f"{input_file}_{tokenizer.name_or_path}_{max_length}_{MMAP_DTYPE}"
-    # h = hashlib.md5(key.encode()).hexdigest()[:8]
-    # filename = os.path.basename(input_file)
-    # return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
-
-    if input_file.endswith("stage3.train"):
-        return os.path.join(CACHE_DIR, "stage3.train.cache_09a71b50")
-    elif input_file.endswith("stage3.dev"):
-        return os.path.join(CACHE_DIR, "stage3.dev.cache_2ffef4d6")
-    return None
+    #Include dtype in the hash so old int64 caches are never silently reused.
+    key = f"{input_file}_{tokenizer.name_or_path}_{max_length}_{MMAP_DTYPE}"
+    h = hashlib.md5(key.encode()).hexdigest()[:8]
+    filename = os.path.basename(input_file)
+    return os.path.join(CACHE_DIR, f"{filename}.cache_{h}")
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────

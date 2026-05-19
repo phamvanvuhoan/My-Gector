@@ -131,7 +131,7 @@ def _predict(
         batch = tokenizer(
             srcs[i:i+batch_size],
             return_tensors='pt',
-            max_length=model.config.max_length,
+            #max_length=model.config.max_length,
             padding='max_length',
             truncation=True,
             is_split_into_words=True,
