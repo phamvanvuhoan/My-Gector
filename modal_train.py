@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-36"})
+    .env({"FORCE_REBUILD": "2024-05-38"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -70,7 +70,7 @@ STAGE_CFG = {
         batch_size    = 512,
         warm_batch_size = 256,   # warm epochs
         n_cold_epochs = 1,
-        n_epochs      = 10,
+        n_epochs      = 5,
         save_dir      = f"{SAVE_BASE}/stage2",
     ),
     3: dict(
@@ -187,7 +187,7 @@ def train_stage(
     stage:             int,
     model_id:          str   = "roberta-base",
     restore_dir:       str   = None, # change to f"{SAVE_BASE}/stage1/last" if want to change max_weight at the beginning of epoch
-    max_weight:        float = 3.0,
+    max_weight:        float = 0.0,
     lr:                float = 1e-5,
     cold_lr:           float = 1e-3,
     max_len:           int   = 80,
