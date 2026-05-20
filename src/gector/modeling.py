@@ -97,17 +97,22 @@ class GECToR(PreTrainedModel):
         self.post_init()
         self.tune_bert(False)
 
+    # modeling.py - from_pretrained override
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         import safetensors.torch as st
         import os
+
+        # Tell transformers this is a local path, not a HF repo id
+        if os.path.isdir(pretrained_model_name_or_path):
+            kwargs["local_files_only"] = True
 
         # Load normally first
         model = super().from_pretrained(
             pretrained_model_name_or_path, *args, **kwargs
         )
 
-        # Explicitly reload classifier weights which post_init() may have overwritten
+        # Explicitly reload classifier weights
         weights_path = os.path.join(
             pretrained_model_name_or_path, "model.safetensors"
         )
@@ -120,8 +125,9 @@ class GECToR(PreTrainedModel):
                     for attr in key.split("."):
                         param = getattr(param, attr)
                     param.data.copy_(saved[key])
-            print(f"✓ Classifier weights reloaded explicitly")
-            print(f"  label_proj_layer std: {model.label_proj_layer.weight.std().item():.6f}")
+            print(f"✓ Classifier weights reloaded")
+            print(f"  label_proj_layer std: "
+                f"{model.label_proj_layer.weight.std().item():.6f}")
 
         return model
 

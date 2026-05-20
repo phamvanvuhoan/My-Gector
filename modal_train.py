@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-35"})
+    .env({"FORCE_REBUILD": "2024-05-36"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -58,10 +58,10 @@ STAGE_CFG = {
     1: dict(
         train_file    = f"{DATA}/stage1.train",
         valid_file    = f"{DATA}/stage1.dev",
-        batch_size    = 1048,   # cold epochs
+        batch_size    = 512,   # cold epochs
         warm_batch_size = 512,   # warm epochs
         n_cold_epochs = 2,
-        n_epochs      = 10,
+        n_epochs      = 5,
         save_dir      = f"{SAVE_BASE}/stage1",
     ),
     2: dict(
@@ -89,8 +89,8 @@ STAGE_CFG = {
 
 @app.function(
     image   = image,
-    cpu     = 8,
-    memory  = 49152,      # 48 GB — stage1 has 8.8M sentences
+    cpu     = 6,
+    memory  = 36864,      # 36 GB — stage1 has 8.8M sentences
     volumes = {MOUNT: volume},
     timeout = 14400,      # 4 hours
 )
@@ -171,9 +171,9 @@ def preprocess(
 
 @app.function(
     image   = image,
-    gpu     = "A10G",
+    gpu     = "A100-40GB",
     cpu     = 4,
-    memory  = 16384,
+    memory  = 8192,
     volumes = {MOUNT: volume},
     timeout = 86400,   # 24 h
     secrets = [modal.Secret.from_name("wandb-secret")],
@@ -246,11 +246,11 @@ def train_stage(
         "--lr_scheduler_type",   lr_scheduler_type,
         "--seed",                str(seed),
         "--resume_ckpt",         "auto",
-        "--ckpt_steps",          "500",
+        "--ckpt_steps",          "1000",
         "--ckpt_limit",          "2",
         "--restore_vocab_official", VOCAB_DIR,
         "--wandb_project",       "gector",
-        "--wandb_run_name",      f"stage{stage}_{model_id}_v2",
+        "--wandb_run_name",      f"stage{stage}_{model_id}_v3",
         "--max_weight",          str(max_weight),
     ]
 
@@ -278,15 +278,36 @@ def train_stage(
     timeout=180,
 )
 def test():
-    from gector import GECToR
+    from transformers import AutoTokenizer
+    from gector import GECToR, predict, load_verb_dict
+    import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage1/best")
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage1/last").eval()
+    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage1/last")
+    encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
-    # Check IMMEDIATELY, nothing else in between
-    w = model.label_proj_layer.weight
-    print(f"std right after from_pretrained: {w.std().item():.6f}")
-    print(f"label_proj_layer std: {model.label_proj_layer.weight.std().item():.6f}")
-    print(f"requires_grad: {w.requires_grad}")
+    if torch.cuda.is_available():
+        model.cuda()
+
+    srcs = [
+        "This are wrong sentences",
+        "He go to school yesterday",
+        "I have went to the store",
+        "She don't knows the answer",
+        "There is many people here",
+    ]
+
+    corrected = predict(
+        model, tokenizer, srcs, encode, decode,
+        keep_confidence = 0.0,
+        min_error_prob  = 0.0,
+        n_iteration     = 1,
+    )
+
+    for src, cor in zip(srcs, corrected):
+        print(f"SRC: {src}")
+        print(f"COR: {cor}")
+        print()
 
 # ── Per-stage entrypoints ─────────────────────────────────────────────────────
 
@@ -295,7 +316,7 @@ def run_stage1(
     model_id:   str   = "roberta-base",
     batch_size: int   = 0,
     lr:         float = 1e-5,
-    num_warmup_steps: int = 1000,
+    num_warmup_steps: int = 500,
     seed:       int   = 10,
 ):
     """Train stage 1 (large synthetic corpus)."""
