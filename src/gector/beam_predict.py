@@ -55,77 +55,62 @@ def _score_hypotheses(
     keep_id = model.config.label2id[model.config.keep_label]
     incor_id = model.config.d_label2id[model.config.incorrect_label]
 
-    all_candidates = []   # List[List[(score_delta, labels)]]
+    all_candidates = []
     all_no_corrections = []
 
     for i in range(len(srcs)):
-        word_ids_fn = batch['input_ids']  # we use word_ids from tokenizer
-        lp = log_probs[i]          # (seq_len, num_labels)
-        pd = prob_d[i]             # (seq_len, 2)
+        lp  = log_probs[i]
+        pd  = prob_d[i]
+        wm  = word_masks[i]
 
-        # Apply keep_confidence bias (same as greedy predict())
         lp[:, keep_id] += keep_confidence
 
-        # Sentence-level max error prob threshold
-        wm = word_masks[i]
         max_err_prob = (pd[:, incor_id] * wm).max().item()
         if max_err_prob < min_error_prob:
-            # Force all-KEEP: this hypothesis needs no correction
             all_no_corrections.append(True)
-            all_candidates.append([(0.0, ['$KEEP'] * lp.size(0))])
+            all_candidates.append([(0.0, ['$KEEP'] * int(wm.sum().item()))])
             continue
 
-        # --- Beam expansion ---
-        # For efficiency we use the greedy sequence score as the base beam,
-        # plus top-K alternatives found by perturbing each position.
-        #
-        # Strategy: compute the sentence-level score as the SUM of
-        # per-token log-probs (only at word-start positions), then
-        # expand by swapping one token to its 2nd-best prediction.
-        # This gives O(seq_len * beam_size) candidates cheaply.
+        # ── Align to word-level ───────────────────────────────────────
+        word_ids_i   = batch.word_ids(i)
+        prev_word_id = None
+        word_start_positions = []
 
-        word_positions = [
-            j for j in range(lp.size(0))
-            if batch.get('attention_mask', None) is not None
-            # filter to real word-start tokens using word_masks
-            and wm[j].item() == 1
-        ]
+        for pos, wid in enumerate(word_ids_i):
+            if wid is None:
+                continue
+            if wid != prev_word_id:
+                word_start_positions.append(pos)   # subword positions of word-starts
+            prev_word_id = wid
 
-        # Base greedy sequence
-        greedy_ids = lp.argmax(dim=-1)  # (seq_len,)
-        base_score = lp[
-            range(lp.size(0)), greedy_ids
-        ][wm.bool()].sum().item()
-        greedy_labels = [
-            model.config.id2label[idx.item()] for idx in greedy_ids
-        ]
+        # word-level log-probs: only word-start positions
+        # shape: (n_words, num_labels)
+        word_lp = lp[word_start_positions]
+
+        # Base greedy at word level
+        greedy_ids    = word_lp.argmax(dim=-1)           # (n_words,)
+        base_score    = word_lp[range(len(word_start_positions)), greedy_ids].sum().item()
+        greedy_labels = [model.config.id2label[idx.item()] for idx in greedy_ids]
 
         candidates = [(base_score, greedy_labels)]
 
-        # Expand: for each word position, try the 2nd-best tag
-        top2 = lp.topk(k=min(2, lp.size(-1)), dim=-1)  # values, indices
-        for pos in word_positions:
-            if top2.indices[pos, 0].item() == top2.indices[pos, 1].item():
+        # Expand: try 2nd-best at each word position
+        top2 = word_lp.topk(k=min(2, word_lp.size(-1)), dim=-1)
+        for pos_idx in range(len(word_start_positions)):
+            if top2.indices[pos_idx, 0] == top2.indices[pos_idx, 1]:
                 continue
-            alt_id = top2.indices[pos, 1].item()
-            # Score = base_score - score_of_greedy_at_pos + score_of_alt
-            delta = (
-                top2.values[pos, 1].item()
-                - top2.values[pos, 0].item()
-            )
+            delta     = top2.values[pos_idx, 1].item() - top2.values[pos_idx, 0].item()
+            alt_id    = top2.indices[pos_idx, 1].item()
             alt_labels = greedy_labels.copy()
-            alt_labels[pos] = model.config.id2label[alt_id]
+            alt_labels[pos_idx] = model.config.id2label[alt_id]
             candidates.append((base_score + delta, alt_labels))
 
-        # Keep only top beam_size candidates by score
         candidates.sort(key=lambda x: x[0], reverse=True)
         candidates = candidates[:beam_size]
 
-        # Determine no_correction: True only if the BEST candidate is all-KEEP
-        best_labels = candidates[0][1]
         no_corr = all(
             model.config.label2id.get(l, -1) in no_correction_ids
-            for l in best_labels
+            for l in candidates[0][1]
         )
         all_no_corrections.append(no_corr)
         all_candidates.append(candidates)
@@ -229,23 +214,20 @@ def beam_predict(
             for score_delta, labels in candidates:
                 child = parent_hyp.clone()
 
-                # Apply edits to produce next token sequence
                 edited = edit_src_by_tags(
                     [child.tokens],
                     [labels],
                     encode, decode
                 )[0]
 
-                # Length penalty: reward sentences that actually changed
                 n_edits = sum(
                     1 for l in labels
-                    if model.config.label2id.get(l, -1)
-                    not in no_correction_ids
+                    if model.config.label2id.get(l, -1) not in no_correction_ids
                 )
                 penalty = length_penalty * n_edits
 
                 child.tokens = edited
-                child.score += score_delta + penalty
+                child.score  = score_delta + penalty  # ← replace +=, don't accumulate across iterations
                 child.tag_history.append(labels)
                 state_new_beams[s_idx].append(child)
 
