@@ -193,10 +193,21 @@ class GECToR(PreTrainedModel):
                 logits_d.view(-1, self.config.d_num_labels - 1),
                 d_labels.view(-1)
             )
-            loss_labels = self.loss_fn(       # weighted loss for tags
-                logits_labels.view(-1, self.config.num_labels - 1),
-                labels.view(-1)
-            )
+            # loss_labels = self.loss_fn(       # weighted loss for tags
+            #     logits_labels.view(-1, self.config.num_labels - 1),
+            #     labels.view(-1)
+            # )
+            #--------------------------------------------------------------
+            word_mask_flat = word_masks.view(-1).float()  # 1 at word-starts, 0 elsewhere
+            label_flat = labels.view(-1)
+            logit_flat = logits_labels.view(-1, self.config.num_labels - 1)
+
+            # Zero out non-word-start positions so they don't contribute
+            label_flat = label_flat.clone()
+            label_flat[word_mask_flat == 0] = -100   # ignored by CrossEntropyLoss
+
+            loss_labels = self.loss_fn(logit_flat, label_flat)
+            #-------------------------------------------------------------
             loss = loss_d + loss_labels
 
             pred_labels = torch.argmax(logits_labels, dim=-1)

@@ -187,7 +187,7 @@ def train_stage(
     stage:             int,
     model_id:          str   = "roberta-base",
     restore_dir:       str   = None, # change to f"{SAVE_BASE}/stage1/last" if want to change max_weight at the beginning of epoch
-    max_weight:        float = 0.0,
+    max_weight:        float = 3.0,
     lr:                float = 1e-5,
     cold_lr:           float = 1e-3,
     max_len:           int   = 80,
@@ -250,7 +250,7 @@ def train_stage(
         "--ckpt_limit",          "2",
         "--restore_vocab_official", VOCAB_DIR,
         "--wandb_project",       "gector",
-        "--wandb_run_name",      f"stage{stage}_{model_id}_v3",
+        "--wandb_run_name",      f"stage{stage}_{model_id}_v3*",
         "--max_weight",          str(max_weight),
     ]
 
@@ -279,11 +279,11 @@ def train_stage(
 )
 def test():
     from transformers import AutoTokenizer
-    from gector import GECToR, predict, load_verb_dict
+    from gector import GECToR, load_verb_dict, beam_predict
     import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage1/last").eval()
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage1/last")
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/last").eval()
+    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/last")
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
@@ -297,7 +297,7 @@ def test():
         "There is many people here",
     ]
 
-    corrected = predict(
+    corrected = beam_predict(
         model, tokenizer, srcs, encode, decode,
         keep_confidence = 0.0,
         min_error_prob  = 0.0,
