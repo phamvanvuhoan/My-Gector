@@ -34,6 +34,10 @@ def _score_hypotheses(
         is_split_into_words=True,
         add_special_tokens=not model.config.is_official_model
     )
+
+    # Save word_ids BEFORE converting to dict
+    word_ids_list = [batch.word_ids(i) for i in range(len(srcs))]  # ← save here
+
     word_masks = torch.tensor(
         get_word_masks_from_word_ids(
             batch.word_ids,
@@ -72,7 +76,7 @@ def _score_hypotheses(
             continue
 
         # ── Align to word-level ───────────────────────────────────────
-        word_ids_i   = batch.word_ids(i)
+        word_ids_i   = word_ids_list[i]
         prev_word_id = None
         word_start_positions = []
 
