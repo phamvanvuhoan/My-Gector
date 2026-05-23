@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-40"})
+    .env({"FORCE_REBUILD": "2024-05-41"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -282,8 +282,8 @@ def test():
     from gector import GECToR, load_verb_dict, beam_predict
     import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage2/last").eval()
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage2/last")
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/last").eval()
+    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/last")
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
@@ -301,7 +301,7 @@ def test():
         model, tokenizer, srcs, encode, decode,
         keep_confidence = 0.0,
         min_error_prob  = 0.0,
-        n_iteration     = 1,
+        n_iteration     = 5,
     )
 
     for src, cor in zip(srcs, corrected):
