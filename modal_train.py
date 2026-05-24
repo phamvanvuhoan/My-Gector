@@ -79,7 +79,7 @@ STAGE_CFG = {
         batch_size    = 256,
         warm_batch_size = 128,   # warm epochs
         n_cold_epochs = 0,
-        n_epochs      = 10,
+        n_epochs      = 3,
         save_dir      = f"{SAVE_BASE}/stage3",
     ),
 }
