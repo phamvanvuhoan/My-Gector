@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-43"})
+    .env({"FORCE_REBUILD": "2024-05-44"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -297,7 +297,7 @@ def test():
         "There is many people here",
     ]
 
-    corrected = predict(
+    corrected = beam_predict(
         model, tokenizer, srcs, encode, decode,
         keep_confidence = 0.0,
         min_error_prob  = 0.0,
