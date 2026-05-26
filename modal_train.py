@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-44"})
+    .env({"FORCE_REBUILD": "2024-05-45"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -282,8 +282,8 @@ def test():
     from gector import GECToR, load_verb_dict, beam_predict, predict
     import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage2/last").eval()
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage2/last", add_prefix_space=True)
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/last").eval()
+    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/last", add_prefix_space=True)
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
@@ -292,16 +292,18 @@ def test():
     srcs = [
         "This are wrong sentences",
         "He go to school yesterday",
-        "I have went to the store",
+        "I have went to the store since morning",
         "She don't knows the answer",
         "There is many people here",
+        "This Today I today went to the store today this morning today",
     ]
 
-    corrected = beam_predict(
+    corrected = predict(
         model, tokenizer, srcs, encode, decode,
         keep_confidence = 0.0,
         min_error_prob  = 0.0,
-        n_iteration     = 5,
+        n_iteration     = 3,
+        max_edits       = 2,   # cap the number of edits per sentence to 2 for this test
     )
 
     for src, cor in zip(srcs, corrected):

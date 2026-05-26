@@ -120,7 +120,8 @@ def _predict(
     srcs: List[str],
     keep_confidence: float=0,
     min_error_prob: float=0,
-    batch_size: int=128
+    batch_size: int=128,
+    max_edits: int = 0,   # ← add this, 0 = no cap
 ):
     itr = list(range(0, len(srcs), batch_size))
     pred_labels = []
@@ -167,6 +168,26 @@ def _predict(
                 previous_word_idx = idx
             pred_labels.append(labels)
             no_corrections.append(no_correct)
+        
+        # ── Edit cap ──────────────────────────────────────────────────────
+        if max_edits > 0:
+            no_correction_ids_set = set(no_correction_ids)
+            capped_labels = []
+            for labels in pred_labels[-len(outputs.pred_labels):]:
+                edit_count = 0
+                capped = []
+                for lbl in labels:
+                    lid = model.config.label2id.get(lbl, -1)
+                    if lid not in no_correction_ids_set:
+                        edit_count += 1
+                        if edit_count > max_edits:
+                            capped.append('$KEEP')
+                            continue
+                    capped.append(lbl)
+                capped_labels.append(capped)
+            # Replace the labels we just added
+            pred_labels[-len(outputs.pred_labels):] = capped_labels
+
     return pred_labels, no_corrections
 
 def predict(
@@ -178,7 +199,8 @@ def predict(
     keep_confidence: float=0,
     min_error_prob: float=0,
     batch_size: int=128,
-    n_iteration: int=5
+    n_iteration: int=5,
+    max_edits: int = 0,   # ← add this, 0 = no cap
 ) -> List[str]:
     srcs = [['$START'] + src.split(' ') for src in srcs]
     final_edited_sents = ['-1'] * len(srcs)
@@ -192,7 +214,8 @@ def predict(
             to_be_processed,
             keep_confidence,
             min_error_prob,
-            batch_size
+            batch_size,
+            max_edits = max_edits,
         )
         current_srcs = []
         current_pred_labels = []
