@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-41"})
+    .env({"FORCE_REBUILD": "2024-05-43"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -79,7 +79,7 @@ STAGE_CFG = {
         batch_size    = 256,
         warm_batch_size = 128,   # warm epochs
         n_cold_epochs = 0,
-        n_epochs      = 3,
+        n_epochs      = 5,
         save_dir      = f"{SAVE_BASE}/stage3",
     ),
 }
@@ -215,7 +215,7 @@ def train_stage(
 
     # Default restore: previous stage's best checkpoint
     if restore_dir is None and stage > 1:
-        prev_best = STAGE_CFG[stage - 1]["save_dir"] + "/best"
+        prev_best = STAGE_CFG[stage - 1]["save_dir"] + "/last"
         if Path(prev_best).exists():
             restore_dir = prev_best
             print(f"Stage {stage}: restoring weights from {restore_dir}")
@@ -279,11 +279,11 @@ def train_stage(
 )
 def test():
     from transformers import AutoTokenizer
-    from gector import GECToR, load_verb_dict, beam_predict
+    from gector import GECToR, load_verb_dict, beam_predict, predict
     import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/last").eval()
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/last")
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage2/last").eval()
+    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage2/last", add_prefix_space=True)
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
@@ -297,7 +297,7 @@ def test():
         "There is many people here",
     ]
 
-    corrected = beam_predict(
+    corrected = predict(
         model, tokenizer, srcs, encode, decode,
         keep_confidence = 0.0,
         min_error_prob  = 0.0,

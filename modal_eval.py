@@ -104,8 +104,8 @@ def evaluate(
     src:              str   = f"{DATA}/bea19_dev.src",
     ref_m2:           str   = f"{DATA}/bea19_dev.m2",
     run_name:         str   = "eval",
-    keep_confidence:  float = 0.0,
-    min_error_prob:   float = 0.0,
+    keep_confidence:  float = 0.1,
+    min_error_prob:   float = 0.1,
     n_iteration:      int   = 5,
     batch_size:       int   = 128,
     beam_size:        int   = 1,
@@ -435,8 +435,8 @@ def run_eval(
     stage:            int   = 3,
     which:            str   = "best",       # "best" or "last"
     restore_dir:      str   = "",           # override: use any volume path directly
-    keep_confidence:  float = 0.0,
-    min_error_prob:   float = 0.0,
+    keep_confidence:  float = 0.1,
+    min_error_prob:   float = 0.1,
     n_iteration:      int   = 5,
     batch_size:       int   = 128,
     beam_size:        int   = 1,
