@@ -63,6 +63,20 @@ def _prune_checkpoints(save_dir: str, limit: int) -> None:
         shutil.rmtree(old)
         print(f"  Pruned checkpoint: {old}")
 
+# with probability p_skip_clean during training
+def collate_with_easy_skip(batch, p_skip_clean=0.5, keep_id=1):
+    filtered = []
+    for item in batch:
+        labels = item['labels']
+        has_edit = any(
+            l != keep_id and l != -100 
+            for l in labels.tolist()
+        )
+        if has_edit or random.random() > p_skip_clean:
+            filtered.append(item)
+    if not filtered:
+        filtered = batch   # safety: never return empty batch
+    return torch.utils.data.dataloader.default_collate(filtered)
 
 def _make_dataloader(
     dataset,
@@ -82,8 +96,11 @@ def _make_dataloader(
       epochs (no re-open cost).
     - pin_memory=True                 — DMA-friendly host→device transfer.
     """
+    from functools import partial
+    
     return DataLoader(
         dataset,
+        collate_fn = partial(collate_with_easy_skip, p_skip_clean=0.5),
         batch_size              = batch_size,
         shuffle                 = shuffle,
         num_workers             = num_workers,

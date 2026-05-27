@@ -435,9 +435,9 @@ def run_eval(
     stage:            int   = 3,
     which:            str   = "best",       # "best" or "last"
     restore_dir:      str   = "",           # override: use any volume path directly
-    keep_confidence:  float = 0.1,
-    min_error_prob:   float = 0.1,
-    n_iteration:      int   = 5,
+    keep_confidence:  float = 0.2,
+    min_error_prob:   float = 0.2,
+    n_iteration:      int   = 3,
     batch_size:       int   = 128,
     beam_size:        int   = 1,
     beta:             float = 0.5,

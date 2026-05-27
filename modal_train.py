@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-46"})
+    .env({"FORCE_REBUILD": "2024-05-47"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -282,8 +282,8 @@ def test():
     from gector import GECToR, load_verb_dict, beam_predict, predict
     import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/last").eval()
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/last", add_prefix_space=True)
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/best").eval()
+    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/best", add_prefix_space=True)
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
@@ -300,10 +300,15 @@ def test():
 
     corrected = predict(
         model, tokenizer, srcs, encode, decode,
-        keep_confidence = 0.0,
-        min_error_prob  = 0.0,
+        keep_confidence = 0.2,
+        min_error_prob  = 0.2,
         n_iteration     = 3,
     )
+
+    print("$KEEP weight:", model.loss_fn.weight[model.config.label2id['$KEEP']])
+    print("$DELETE weight:", model.loss_fn.weight[model.config.label2id['$DELETE']])
+    print("$TRANSFORM_VERB_VB_VBZ weight:", 
+        model.loss_fn.weight[model.config.label2id['$TRANSFORM_VERB_VB_VBZ']])
 
     for src, cor in zip(srcs, corrected):
         print(f"SRC: {src}")
