@@ -97,7 +97,7 @@ def _make_dataloader(
     - pin_memory=True                 — DMA-friendly host→device transfer.
     """
     from functools import partial
-    
+
     return DataLoader(
         dataset,
         collate_fn = partial(collate_with_easy_skip, p_skip_clean=0.5),
@@ -461,6 +461,13 @@ def main(args):
             with open(os.path.join(args.save_dir, "log.json"), "w") as f:
                 json.dump(logs, f, indent=2)
 
+        if args.ckpt_epochs > 0 and (epoch + 1) % args.ckpt_epochs == 0:
+            epoch_ckpt_path = os.path.join(args.save_dir, f"checkpoint_epoch{epoch}")
+            if accelerator.is_main_process:
+                accelerator.unwrap_model(model).save_pretrained(epoch_ckpt_path)
+                tokenizer.save_pretrained(epoch_ckpt_path)
+                print(f"  Epoch checkpoint saved → {epoch_ckpt_path}")
+
             if wandb.run is not None:
                 wandb.log({
                     "epoch/train_loss":       train_log["loss"],
@@ -522,6 +529,8 @@ def get_parser():
     p.add_argument("--max_weight", type=float, default=10.0)
     p.add_argument("--warm_batch_size", type=int, default=0,
         help="Batch size for warm epochs. 0 = same as --batch_size")
+    p.add_argument("--ckpt_epochs", type=int, default=0,
+        help="Save a named checkpoint every N epochs. 0 = disabled.")
     return p.parse_args()
 
 
