@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-45"})
+    .env({"FORCE_REBUILD": "2024-05-46"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -295,7 +295,7 @@ def test():
         "I have went to the store since morning",
         "She don't knows the answer",
         "There is many people here",
-        "This Today I today went to the store today this morning today",
+        "The cat is on the table and it are sleeping",
     ]
 
     corrected = predict(
@@ -303,7 +303,6 @@ def test():
         keep_confidence = 0.0,
         min_error_prob  = 0.0,
         n_iteration     = 3,
-        max_edits       = 2,   # cap the number of edits per sentence to 2 for this test
     )
 
     for src, cor in zip(srcs, corrected):
