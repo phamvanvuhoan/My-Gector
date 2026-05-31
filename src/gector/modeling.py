@@ -1,3 +1,5 @@
+from pyexpat import model
+
 from transformers import AutoModel, AutoTokenizer, AutoConfig, PreTrainedModel
 import torch
 import torch.nn.functional as F
@@ -91,6 +93,8 @@ class GECToR(PreTrainedModel):
         # ── Patch missing config fields from older checkpoints ────────────────
         # if not hasattr(model.config, 'max_length'):
         #     model.config.max_length = 80
+        if hasattr(model.config, 'max_length'):
+            del model.config.max_length
         if not hasattr(model.config, 'label_weights'):
             model.config.label_weights = None
         if not hasattr(model.config, 'is_official_model'):
@@ -328,7 +332,7 @@ class GECToR(PreTrainedModel):
             id2label={v: k for k, v in label2id.items()},
             d_label2id=d_label2id,
             p_dropout=p_dropout,
-            max_length=max_length,
+            #max_length=max_length,
             label_smoothing=label_smoothing,
             has_add_pooling_layer=has_args_add_pooling(transformer_model),
             is_official_model=True
