@@ -1,21 +1,3 @@
-"""
-modal_train.py — GECToR three-stage training on Modal.
-
-Pipeline
---------
-1. Upload raw data to the volume (done outside this file).
-2. Run preprocess_all once — CPU-heavy, no GPU needed.
-3. Run run_stage{1,2,3} — GPU training, resumes automatically after preemption.
-
-Usage
------
-    modal run modal_train.py::preprocess
-    modal run modal_train.py::run_stage1
-    modal run modal_train.py::run_stage2
-    modal run modal_train.py::run_stage3
-    modal run modal_train.py::download_checkpoint --stage 3
-"""
-
 import os
 from pathlib import Path
 
@@ -30,7 +12,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-49"})
+    .env({"FORCE_REBUILD": "2024-05-50"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -79,7 +61,7 @@ STAGE_CFG = {
         batch_size    = 256,
         warm_batch_size = 128,   # warm epochs
         n_cold_epochs = 0,
-        n_epochs      = 1,
+        n_epochs      = 10,
         save_dir      = f"{SAVE_BASE}/stage3",
     ),
 }
@@ -252,7 +234,7 @@ def train_stage(
         "--wandb_project",       "gector",
         "--wandb_run_name",      f"stage{stage}_{model_id}_v3*",
         "--max_weight",          str(max_weight),
-        "--ckpt_epochs",         "1",
+        "--ckpt_epochs",         "2",
     ]
 
     if restore_dir:
@@ -283,8 +265,8 @@ def test():
     from gector import GECToR, load_verb_dict, beam_predict, predict
     import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/last").eval() #hoan11234/tagec-roberta-base
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/last", add_prefix_space=True)
+    model = GECToR.from_pretrained("hoan11234/tagec").eval() #hoan11234/tagec-roberta-base hoan11234/tagec
+    tokenizer = AutoTokenizer.from_pretrained("hoan11234/tagec", add_prefix_space=True)
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
