@@ -432,12 +432,12 @@ def upload_eval_data(
 
 @app.local_entrypoint()
 def run_eval(
-    stage:            int   = 3,
+    stage:            int   = 1,
     which:            str   = "best",       # "best" or "last"
     restore_dir:      str   = "",           # override: use any volume path directly
-    keep_confidence:  float = 0.2,
-    min_error_prob:   float = 0.2,
-    n_iteration:      int   = 3,
+    keep_confidence:  float = 0.0,
+    min_error_prob:   float = 0.0,
+    n_iteration:      int   = 5,
     batch_size:       int   = 128,
     beam_size:        int   = 1,
     beta:             float = 0.5,

@@ -79,7 +79,7 @@ STAGE_CFG = {
         batch_size    = 256,
         warm_batch_size = 128,   # warm epochs
         n_cold_epochs = 0,
-        n_epochs      = 10,
+        n_epochs      = 3,
         save_dir      = f"{SAVE_BASE}/stage3",
     ),
 }
@@ -193,7 +193,7 @@ def train_stage(
     max_len:           int   = 80,
     n_max_labels:      int   = 5000,
     accumulation:      int   = 1,
-    label_smoothing:   float = 0.0,
+    label_smoothing:   float = 0.1,
     num_warmup_steps:  int   = 200,
     lr_scheduler_type: str   = "constant",
     seed:              int   = 10,
@@ -252,7 +252,7 @@ def train_stage(
         "--wandb_project",       "gector",
         "--wandb_run_name",      f"stage{stage}_{model_id}_v3*",
         "--max_weight",          str(max_weight),
-        "--ckpt_epochs",         "2",
+        "--ckpt_epochs",         "1",
     ]
 
     if restore_dir:
@@ -283,8 +283,8 @@ def test():
     from gector import GECToR, load_verb_dict, beam_predict, predict
     import torch
 
-    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/best").eval()
-    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/best", add_prefix_space=True)
+    model = GECToR.from_pretrained("hoan11234/tagec-roberta-base").eval() 
+    tokenizer = AutoTokenizer.from_pretrained("hoan11234/tagec-roberta-base", add_prefix_space=True)
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
@@ -301,15 +301,15 @@ def test():
 
     corrected = predict(
         model, tokenizer, srcs, encode, decode,
-        keep_confidence = 0.2,
-        min_error_prob  = 0.2,
+        keep_confidence = 0.0,
+        min_error_prob  = 0.0,
         n_iteration     = 3,
     )
 
-    print("$KEEP weight:", model.loss_fn.weight[model.config.label2id['$KEEP']])
-    print("$DELETE weight:", model.loss_fn.weight[model.config.label2id['$DELETE']])
-    print("$TRANSFORM_VERB_VB_VBZ weight:", 
-        model.loss_fn.weight[model.config.label2id['$TRANSFORM_VERB_VB_VBZ']])
+    # print("$KEEP weight:", model.loss_fn.weight[model.config.label2id['$KEEP']])
+    # print("$DELETE weight:", model.loss_fn.weight[model.config.label2id['$DELETE']])
+    # print("$TRANSFORM_VERB_VB_VBZ weight:", 
+    #     model.loss_fn.weight[model.config.label2id['$TRANSFORM_VERB_VB_VBZ']])
 
     for src, cor in zip(srcs, corrected):
         print(f"SRC: {src}")
@@ -387,6 +387,28 @@ def download_checkpoint(
         print(f"  {dest}")
     print("✓ Download complete.")
 
+
+@app.function(
+    image   = modal.Image.debian_slim().pip_install("huggingface_hub"),
+    volumes = {MOUNT: volume},
+    secrets = [modal.Secret.from_name("huggingface-secret")],
+)
+def upload_from_volume(repo_id: str, dir: str):
+    import os
+    from huggingface_hub import create_repo, upload_folder
+    from huggingface_hub import HfApi
+    api = HfApi(token=os.environ["HF_TOKEN"])
+    print(api.whoami()["name"])
+    create_repo(repo_id=repo_id, exist_ok=True, repo_type="model")
+    upload_folder(folder_path=dir, repo_id=repo_id, repo_type="model")
+    print(f"Uploaded → https://huggingface.co/{repo_id}")
+
+@app.local_entrypoint()
+def upload(
+    repo_id: str,
+    dir:     str = "/gector-data/checkpoints/stage3/last",
+):
+    upload_from_volume.remote(repo_id=repo_id, dir=dir)
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 

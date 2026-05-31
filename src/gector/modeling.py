@@ -30,56 +30,37 @@ class GECToRPredictionOutput:
 
 class GECToR(PreTrainedModel):
     config_class = GECToRConfig
-    def __init__(
-        self,
-        config: GECToRConfig
-    ):
+    def __init__(self, config: GECToRConfig):
         super().__init__(config)
         self.config = config
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_id
-        )
         
-        # if self.config.has_add_pooling_layer:
-        #     self.bert = AutoModel.from_pretrained(
-        #         self.config.model_id,
-        #         add_pooling_layer=False
-        #     )
-        # else:
-        #     self.bert = AutoModel.from_pretrained(
-        #         self.config.model_id
-        #     )
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_id)
+        
+        # Always use from_config here — real weights come from load_state_dict
+        # called by from_pretrained AFTER __init__. Using from_pretrained here
+        # conflicts with the meta device context that transformers sets up
+        # internally during from_pretrained, causing the RuntimeError we saw.
         bert_config = AutoConfig.from_pretrained(self.config.model_id)
         if self.config.has_add_pooling_layer:
-            self.bert = AutoModel.from_config(
-                bert_config,
-                add_pooling_layer=False
-            )
+            self.bert = AutoModel.from_config(bert_config, add_pooling_layer=False)
         else:
             self.bert = AutoModel.from_config(bert_config)
 
-        # Build weighted loss; falls back to uniform if no weights given
-        if config.label_weights is not None:
-            weight_tensor = torch.tensor(
-                config.label_weights, dtype=torch.float
-            )
-        else:
-            weight_tensor = None
-        
-        # +1 is for $START token
-        # Note: In transformers > 4.49.0, `self.bert` is loaded
-        #   as a meta tensors, so the model does not hold actual values. 
-        #   Therefore, the default setting `mean_resizing=True` causes an error 
-        #   because it cannot compute statistics for the existing embeddings.
-        #   For now, we avoid it by setting it to False.
         self.bert.resize_token_embeddings(
             self.bert.config.vocab_size + 1,
             mean_resizing=False
         )
+
+        label_weights = getattr(config, 'label_weights', None)
+        if label_weights is not None:
+            weight_tensor = torch.tensor(label_weights, dtype=torch.float)
+        else:
+            weight_tensor = None
+
         self.label_proj_layer = nn.Linear(
             self.bert.config.hidden_size,
             self.config.num_labels - 1
-        )  # -1 is for <PAD>
+        )
         self.d_proj_layer = nn.Linear(
             self.bert.config.hidden_size,
             self.config.d_num_labels - 1
@@ -87,35 +68,45 @@ class GECToR(PreTrainedModel):
         self.dropout = nn.Dropout(self.config.p_dropout)
         self.loss_fn = CrossEntropyLoss(
             label_smoothing=self.config.label_smoothing,
-            weight=weight_tensor          # <-- only change here
+            weight=weight_tensor
         )
-        # Detection loss stays unweighted (only 2 classes, balanced enough)
         self.loss_fn_d = CrossEntropyLoss(
             label_smoothing=self.config.label_smoothing
         )
-        
         self.post_init()
         self.tune_bert(False)
 
-    # modeling.py - from_pretrained override
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         import safetensors.torch as st
         import os
 
-        # Tell transformers this is a local path, not a HF repo id
         if os.path.isdir(pretrained_model_name_or_path):
             kwargs["local_files_only"] = True
 
-        # Load normally first
         model = super().from_pretrained(
             pretrained_model_name_or_path, *args, **kwargs
         )
 
-        # Explicitly reload classifier weights
-        weights_path = os.path.join(
-            pretrained_model_name_or_path, "model.safetensors"
-        )
+        # ── Patch missing config fields from older checkpoints ────────────────
+        if not hasattr(model.config, 'max_length'):
+            model.config.max_length = 80
+        if not hasattr(model.config, 'label_weights'):
+            model.config.label_weights = None
+        if not hasattr(model.config, 'is_official_model'):
+            model.config.is_official_model = False
+
+        # ── Force reload classifier weights ───────────────────────────────────
+        # post_init() calls _init_weights which randomly reinitializes
+        # label_proj_layer and d_proj_layer AFTER load_state_dict runs.
+        # We fix this by explicitly reloading from the saved weights file.
+        if os.path.isdir(pretrained_model_name_or_path):
+            weights_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        else:
+            # HuggingFace Hub path — download the file
+            from huggingface_hub import hf_hub_download
+            weights_path = hf_hub_download(pretrained_model_name_or_path, "model.safetensors")
+
         if os.path.exists(weights_path):
             saved = st.load_file(weights_path)
             for key in ["label_proj_layer.weight", "label_proj_layer.bias",
@@ -125,9 +116,11 @@ class GECToR(PreTrainedModel):
                     for attr in key.split("."):
                         param = getattr(param, attr)
                     param.data.copy_(saved[key])
-            print(f"✓ Classifier weights reloaded")
-            print(f"  label_proj_layer std: "
-                f"{model.label_proj_layer.weight.std().item():.6f}")
+            print(f"✓ Classifier weights reloaded from {pretrained_model_name_or_path}")
+            print(f"  label_proj_layer std: {model.label_proj_layer.weight.std().item():.6f}")
+        else:
+            print(f"WARNING: model.safetensors not found at {weights_path}, "
+                f"classifier weights may be random")
 
         return model
 
