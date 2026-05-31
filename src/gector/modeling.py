@@ -89,17 +89,14 @@ class GECToR(PreTrainedModel):
         )
 
         # ── Patch missing config fields from older checkpoints ────────────────
-        if not hasattr(model.config, 'max_length'):
-            model.config.max_length = 80
+        # if not hasattr(model.config, 'max_length'):
+        #     model.config.max_length = 80
         if not hasattr(model.config, 'label_weights'):
             model.config.label_weights = None
         if not hasattr(model.config, 'is_official_model'):
             model.config.is_official_model = False
 
         # ── Force reload classifier weights ───────────────────────────────────
-        # post_init() calls _init_weights which randomly reinitializes
-        # label_proj_layer and d_proj_layer AFTER load_state_dict runs.
-        # We fix this by explicitly reloading from the saved weights file.
         if os.path.isdir(pretrained_model_name_or_path):
             weights_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
         else:
@@ -131,8 +128,6 @@ class GECToR(PreTrainedModel):
     def _init_weights(self, module) -> None:
         """Initialize the weights"""
         if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(
                 mean=0.0,
                 std=self.config.initializer_range

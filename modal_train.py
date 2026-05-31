@@ -30,7 +30,7 @@ MOUNT  = "/gector-data"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .env({"FORCE_REBUILD": "2024-05-48"})
+    .env({"FORCE_REBUILD": "2024-05-49"})
     .pip_install(
         "torch>=2.6.0",
         "transformers>=4.49.0",
@@ -79,7 +79,7 @@ STAGE_CFG = {
         batch_size    = 256,
         warm_batch_size = 128,   # warm epochs
         n_cold_epochs = 0,
-        n_epochs      = 3,
+        n_epochs      = 1,
         save_dir      = f"{SAVE_BASE}/stage3",
     ),
 }
@@ -283,8 +283,8 @@ def test():
     from gector import GECToR, load_verb_dict, beam_predict, predict
     import torch
 
-    model = GECToR.from_pretrained("hoan11234/tagec-roberta-base").eval() 
-    tokenizer = AutoTokenizer.from_pretrained("hoan11234/tagec-roberta-base", add_prefix_space=True)
+    model = GECToR.from_pretrained("/gector-data/checkpoints/stage3/last").eval() #hoan11234/tagec-roberta-base
+    tokenizer = AutoTokenizer.from_pretrained("/gector-data/checkpoints/stage3/last", add_prefix_space=True)
     encode, decode = load_verb_dict("/gector-data/data/verb-form-vocab.txt")
 
     if torch.cuda.is_available():
